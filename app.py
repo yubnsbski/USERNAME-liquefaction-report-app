@@ -79,43 +79,79 @@ def plot_locations_scatter(df: pd.DataFrame) -> bytes:
     ax.grid(True, alpha=0.3)
     return fig_to_png_bytes(fig)
 
-# ============ PDF生成（fpdf2） ============
+# ============ PDF Generation (fpdf2) ============
+# Use built-in Helvetica font for reliable PDF generation without external font files
+PDF_FONT = "Helvetica"
+
+
+def sanitize_text_for_pdf(text: str) -> str:
+    """Convert non-ASCII characters to ASCII equivalents for PDF compatibility.
+    
+    The built-in Helvetica font only supports Latin-1 characters.
+    This function replaces common Unicode characters with ASCII equivalents.
+    """
+    if not isinstance(text, str):
+        return str(text) if text is not None else ""
+    
+    replacements = {
+        "\u2013": "-",  # en-dash
+        "\u2014": "-",  # em-dash
+        "\u2018": "'",  # left single quote
+        "\u2019": "'",  # right single quote
+        "\u201c": '"',  # left double quote
+        "\u201d": '"',  # right double quote
+        "\u2026": "...",  # ellipsis
+        "\u00a0": " ",  # non-breaking space
+        "\u2022": "*",  # bullet
+        "\u00b0": " deg",  # degree symbol
+    }
+    
+    for unicode_char, ascii_char in replacements.items():
+        text = text.replace(unicode_char, ascii_char)
+    
+    # Remove any remaining non-Latin-1 characters
+    return text.encode("latin-1", errors="replace").decode("latin-1")
+
+
 class Booklet(FPDF):
     def header(self):
         pass
 
     def footer(self):
         self.set_y(-15)
-        self.set_font("NotoSans", size=9)
+        self.set_font(PDF_FONT, size=9)
         self.set_text_color(120)
         self.cell(0, 10, f"Page {self.page_no()}", align="C")
 
+
 def add_cover(pdf: Booklet, project: str, author: str, report_date: str):
     pdf.add_page()
-    pdf.set_font("NotoSans", "B", 24)
+    pdf.set_font(PDF_FONT, "B", 24)
     pdf.ln(40)
     pdf.cell(0, 12, "Liquefaction Risk Evaluation Report", ln=1, align="C")
-    pdf.set_font("NotoSans", size=16)
+    pdf.set_font(PDF_FONT, size=16)
     pdf.ln(4)
-    pdf.cell(0, 10, project, ln=1, align="C")
+    pdf.cell(0, 10, sanitize_text_for_pdf(project), ln=1, align="C")
     pdf.ln(10)
-    pdf.set_font("NotoSans", size=12)
-    pdf.cell(0, 8, f"Prepared by: {author}", ln=1, align="C")
-    pdf.cell(0, 8, f"Date: {report_date}", ln=1, align="C")
+    pdf.set_font(PDF_FONT, size=12)
+    pdf.cell(0, 8, f"Prepared by: {sanitize_text_for_pdf(author)}", ln=1, align="C")
+    pdf.cell(0, 8, f"Date: {sanitize_text_for_pdf(report_date)}", ln=1, align="C")
+
 
 def add_toc(pdf: Booklet, df: pd.DataFrame):
     pdf.add_page()
-    pdf.set_font("NotoSans", "B", 16)
+    pdf.set_font(PDF_FONT, "B", 16)
     pdf.cell(0, 10, "Table of Contents", ln=1)
     pdf.ln(2)
-    pdf.set_font("NotoSans", size=12)
+    pdf.set_font(PDF_FONT, size=12)
     for i, r in enumerate(df.itertuples(), start=1):
-        line = f"{i}. {r.id} — {r.ground_type} — FL={r.FL}"
+        line = f"{i}. {sanitize_text_for_pdf(r.id)} - {sanitize_text_for_pdf(r.ground_type)} - FL={r.FL}"
         pdf.cell(0, 8, line, ln=1)
+
 
 def add_overview_charts(pdf: Booklet, bar_png_path: str, loc_png_path: str):
     pdf.add_page()
-    pdf.set_font("NotoSans", "B", 14)
+    pdf.set_font(PDF_FONT, "B", 14)
     pdf.cell(0, 8, "Overview", ln=1)
     pdf.ln(2)
     y_start = pdf.get_y()
@@ -123,42 +159,42 @@ def add_overview_charts(pdf: Booklet, bar_png_path: str, loc_png_path: str):
     pdf.image(loc_png_path, x=110, y=y_start, w=90)
     pdf.ln(100)
 
+
 def add_site_pages(pdf: Booklet, df: pd.DataFrame):
     for r in df.itertuples():
         pdf.add_page()
-        pdf.set_font("NotoSans", "B", 14)
-        pdf.cell(0, 8, f"Site ID: {r.id}", ln=1)
-        pdf.set_font("NotoSans", size=12)
+        pdf.set_font(PDF_FONT, "B", 14)
+        pdf.cell(0, 8, f"Site ID: {sanitize_text_for_pdf(r.id)}", ln=1)
+        pdf.set_font(PDF_FONT, size=12)
         if "lat" in df.columns and "lon" in df.columns:
             pdf.cell(0, 7, f"Coordinates: {r.lat}, {r.lon}", ln=1)
-        pdf.cell(0, 7, f"Ground Type: {r.ground_type}", ln=1)
+        pdf.cell(0, 7, f"Ground Type: {sanitize_text_for_pdf(r.ground_type)}", ln=1)
         pdf.cell(0, 7, f"Corrected FL Value: {r.FL}", ln=1)
-        pdf.cell(0, 7, f"Risk Level: {r.risk_level}", ln=1)
-        pdf.multi_cell(0, 7, f"Design Recommendation: {r.suggestion}", align="L")
+        pdf.cell(0, 7, f"Risk Level: {sanitize_text_for_pdf(r.risk_level)}", ln=1)
+        pdf.multi_cell(0, 7, f"Design Recommendation: {sanitize_text_for_pdf(r.suggestion)}", align="L")
         pdf.ln(2)
-        pdf.set_font("NotoSans", "I", 11)
+        pdf.set_font(PDF_FONT, "I", 11)
         note = getattr(r, "note", "")
         if pd.notna(note) and str(note).strip():
-            pdf.multi_cell(0, 6, f"Remarks: {note}")
+            pdf.multi_cell(0, 6, f"Remarks: {sanitize_text_for_pdf(note)}")
+
 
 def build_pdf_booklet(df: pd.DataFrame, project: str, author: str, report_date: str) -> bytes:
+    if df.empty:
+        raise ValueError("Cannot generate report: No site data provided")
+
     bar_png = save_bytes_to_tmp_png(plot_fl_bar(df))
     loc_png = save_bytes_to_tmp_png(plot_locations_scatter(df))
 
     pdf = Booklet(orientation="P", unit="mm", format="A4")
     pdf.set_auto_page_break(auto=True, margin=15)
 
-    # ✅ Unicode対応フォントを登録
-    pdf.add_font("NotoSans", "", "NotoSans-Regular.ttf", uni=True)
-    pdf.add_font("NotoSans", "B", "NotoSans-Regular.ttf", uni=True)
-    pdf.add_font("NotoSans", "I", "NotoSans-Regular.ttf", uni=True)
-
     add_cover(pdf, project, author, report_date)
     add_toc(pdf, df)
     add_overview_charts(pdf, bar_png, loc_png)
     add_site_pages(pdf, df)
 
-    return pdf.output(dest="S").encode("latin-1")
+    return bytes(pdf.output())
 
 # ============ データ準備（サンプル or アップロード） ============
 def get_sample_df() -> pd.DataFrame:
