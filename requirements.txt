@@ -5,3 +5,6 @@ fpdf2
 plotly
 openpyxl
 bcrypt
+anthropic>=0.40.0
+pytest
+pytest-mock

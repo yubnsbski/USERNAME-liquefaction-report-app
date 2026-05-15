@@ -12,6 +12,7 @@ from plotly.subplots import make_subplots
 import json
 import os
 import io
+import base64
 import bcrypt
 from datetime import date, datetime, timedelta
 import calendar
@@ -35,6 +36,13 @@ DEFAULT_INCOME_CATEGORIES = [
 ]
 
 QUICK_AMOUNTS = [500, 1000, 3000, 5000, 10000, 30000]
+
+OCR_MODEL = "claude-haiku-4-5-20251001"
+
+MEDIA_TYPE_MAP = {
+    "jpg": "image/jpeg", "jpeg": "image/jpeg",
+    "png": "image/png", "gif": "image/gif", "webp": "image/webp",
+}
 
 # ─────────────────────────────────────────────
 # CSS Injection
@@ -600,6 +608,94 @@ def df_to_excel_bytes(df: pd.DataFrame, period_label: str = "") -> bytes:
 
 
 # ─────────────────────────────────────────────
+# OCR Functions
+# ─────────────────────────────────────────────
+
+def _get_api_key() -> str:
+    key = os.environ.get("ANTHROPIC_API_KEY", "")
+    if not key:
+        try:
+            key = st.secrets.get("ANTHROPIC_API_KEY", "")
+        except Exception:
+            pass
+    return key
+
+
+def ocr_receipt_with_claude(image_bytes: bytes, media_type: str) -> dict:
+    """Send receipt image to Claude Vision API and extract structured transaction data."""
+    import anthropic
+
+    api_key = _get_api_key()
+    if not api_key:
+        raise ValueError("ANTHROPIC_API_KEY が設定されていません")
+
+    expense_cats = get_categories("支出")
+    income_cats = get_categories("収入")
+    today_str = date.today().isoformat()
+
+    prompt = f"""以下のレシート・領収書画像を読み取り、JSONのみで返してください（コードブロック不要）。
+
+出力形式:
+{{
+  "date": "YYYY-MM-DD",
+  "type": "支出",
+  "category": "食費",
+  "amount": 1234,
+  "store_name": "店名",
+  "memo": "店名＋主な品目",
+  "items": [{{"name": "品目", "price": 100}}]
+}}
+
+支出カテゴリ候補: {', '.join(expense_cats)}
+収入カテゴリ候補: {', '.join(income_cats)}
+
+- 日付不明の場合は {today_str} を使用
+- 金額不明の場合は 0 を設定
+- itemsは最大10件
+- JSONのみ返すこと"""
+
+    client = anthropic.Anthropic(api_key=api_key)
+    image_data = base64.standard_b64encode(image_bytes).decode("utf-8")
+
+    message = client.messages.create(
+        model=OCR_MODEL,
+        max_tokens=1024,
+        messages=[{
+            "role": "user",
+            "content": [
+                {"type": "image", "source": {"type": "base64", "media_type": media_type, "data": image_data}},
+                {"type": "text", "text": prompt},
+            ],
+        }],
+    )
+
+    raw = message.content[0].text.strip()
+    # Strip markdown code fences if model added them
+    if raw.startswith("```"):
+        raw = "\n".join(raw.split("\n")[1:])
+        raw = raw.rstrip("`").strip()
+
+    return json.loads(raw)
+
+
+_DUMMY_OCR_RESULT = {
+    "date": date.today().isoformat(),
+    "type": "支出",
+    "category": "食費",
+    "amount": 1580,
+    "store_name": "サンプルスーパー",
+    "memo": "サンプルスーパー 食料品",
+    "items": [
+        {"name": "野菜セット", "price": 580},
+        {"name": "牛乳 1L", "price": 198},
+        {"name": "食パン", "price": 298},
+        {"name": "卵 10個", "price": 238},
+        {"name": "ヨーグルト", "price": 266},
+    ],
+}
+
+
+# ─────────────────────────────────────────────
 # UI Sections
 # ─────────────────────────────────────────────
 
@@ -712,6 +808,132 @@ def show_input_tab(year: int, month: int):
             )
 
 
+def show_ocr_tab(year: int, month: int):
+    st.markdown('<div class="section-header">📷 レシートOCR読取</div>', unsafe_allow_html=True)
+    st.caption("レシートや領収書の写真をアップロードすると、AIが自動で情報を読み取ります。")
+    st.markdown("**処理フロー:** 画像アップロード → Claude AI 解析 → 確認フォーム → DB登録")
+
+    has_key = bool(_get_api_key())
+
+    col_upload, col_test = st.columns([3, 1])
+    with col_test:
+        st.markdown("&nbsp;", unsafe_allow_html=True)
+        if st.button("🧪 ダミーでテスト", use_container_width=True, help="APIキーなしでフォームをテストできます"):
+            import copy
+            st.session_state["ocr_result"] = copy.deepcopy(_DUMMY_OCR_RESULT)
+            st.session_state["ocr_source"] = "dummy"
+            st.rerun()
+
+    with col_upload:
+        if not has_key:
+            st.warning("⚠️ `ANTHROPIC_API_KEY` が未設定です。ダミーテストは右のボタンで実行できます。")
+            with st.expander("APIキーの設定方法"):
+                st.code("export ANTHROPIC_API_KEY='sk-ant-...'", language="bash")
+                st.markdown("または `.streamlit/secrets.toml` に:")
+                st.code('ANTHROPIC_API_KEY = "sk-ant-..."', language="toml")
+        else:
+            uploaded = st.file_uploader(
+                "レシート画像をアップロード",
+                type=["jpg", "jpeg", "png", "gif", "webp"],
+                help="JPG / PNG / GIF / WebP 対応",
+                key="ocr_uploader",
+            )
+            if uploaded:
+                st.image(uploaded, caption="アップロード画像", use_column_width=True)
+                if st.button("🔍 AIで読み取る", type="primary", use_container_width=True):
+                    image_bytes = uploaded.read()
+                    ext = uploaded.name.rsplit(".", 1)[-1].lower()
+                    media_type = MEDIA_TYPE_MAP.get(ext, "image/jpeg")
+                    with st.spinner("Claude AIがレシートを解析中..."):
+                        try:
+                            result = ocr_receipt_with_claude(image_bytes, media_type)
+                            st.session_state["ocr_result"] = result
+                            st.session_state["ocr_source"] = "api"
+                            st.success("読み取り完了！内容を確認して登録してください。")
+                            st.rerun()
+                        except json.JSONDecodeError as e:
+                            st.error(f"AI応答のパースに失敗しました: {e}")
+                        except Exception as e:
+                            st.error(f"OCRエラー: {e}")
+
+    # ── 確認・登録フォーム ──
+    if "ocr_result" not in st.session_state:
+        return
+
+    result = st.session_state["ocr_result"]
+    source_label = "ダミーデータ" if st.session_state.get("ocr_source") == "dummy" else "AI読み取り結果"
+    st.markdown("---")
+    st.markdown(f"### {source_label}の確認・修正")
+
+    # 品目一覧表示
+    items = result.get("items") or []
+    if items:
+        items_df = pd.DataFrame(items)
+        items_df.columns = ["品目", "金額(円)"]
+        items_df["金額(円)"] = items_df["金額(円)"].apply(lambda x: f"¥{x:,}")
+        with st.expander(f"品目一覧 ({len(items)}件)", expanded=True):
+            st.dataframe(items_df, use_container_width=True, hide_index=True)
+
+    with st.form("ocr_confirm_form", clear_on_submit=False):
+        col1, col2 = st.columns(2)
+        with col1:
+            tx_type = st.radio(
+                "種別", ["支出", "収入"],
+                index=0 if result.get("type") == "支出" else 1,
+                horizontal=True,
+                key="ocr_type",
+            )
+        with col2:
+            try:
+                ocr_date = date.fromisoformat(result.get("date", date.today().isoformat()))
+            except (ValueError, TypeError):
+                ocr_date = date.today()
+            tx_date = st.date_input("日付", value=ocr_date, key="ocr_date")
+
+        # カテゴリは種別に連動（AIの提案を初期選択）
+        cats = get_categories(tx_type)
+        suggested = result.get("category", "")
+        default_idx = cats.index(suggested) if suggested in cats else 0
+        category = st.selectbox(
+            "カテゴリ（AIの提案から選択・変更可）",
+            cats,
+            index=default_idx,
+            key="ocr_category",
+        )
+
+        amount = st.number_input(
+            "金額（円）",
+            value=max(0, int(result.get("amount", 0))),
+            min_value=0,
+            step=100,
+            format="%d",
+            key="ocr_amount",
+        )
+
+        memo_default = result.get("memo") or result.get("store_name") or ""
+        memo = st.text_input("メモ", value=memo_default, key="ocr_memo")
+
+        col_reg, col_clear = st.columns(2)
+        with col_reg:
+            submitted = st.form_submit_button("💾 登録", type="primary", use_container_width=True)
+        with col_clear:
+            cleared = st.form_submit_button("🗑️ クリア", use_container_width=True)
+
+        if submitted:
+            if amount <= 0:
+                st.error("金額は1円以上入力してください。")
+            elif add_transaction(str(tx_date), tx_type, category, int(amount), memo):
+                st.success(f"✅ 登録完了: {tx_type} {category} ¥{int(amount):,}")
+                st.session_state.pop("ocr_result", None)
+                st.session_state.pop("ocr_source", None)
+                st.rerun()
+
+        if cleared:
+            st.session_state.pop("ocr_result", None)
+            st.session_state.pop("ocr_source", None)
+            st.rerun()
+
+
 def show_list_tab(year: int, month: int):
     st.markdown('<div class="section-header">📋 取引一覧</div>', unsafe_allow_html=True)
 
@@ -719,8 +941,12 @@ def show_list_tab(year: int, month: int):
     with col1:
         filter_type = st.radio("種別フィルター", ["すべて", "支出", "収入"], horizontal=True, key="list_type")
     with col2:
-        all_cats = [c["name"] for c in get_categories()]
-        filter_cats = st.multiselect("カテゴリフィルター", all_cats, key="list_cats")
+        # カテゴリ候補を種別フィルターに連動させる
+        if filter_type == "すべて":
+            cat_pool = [c["name"] for c in get_categories()]
+        else:
+            cat_pool = get_categories(filter_type)
+        filter_cats = st.multiselect("カテゴリフィルター", cat_pool, key="list_cats")
 
     df = get_transactions(
         year=year, month=month,
@@ -1141,27 +1367,31 @@ def main():
     year, month = show_sidebar()
 
     # Main tab navigation
-    tab1, tab2, tab3, tab4, tab5 = st.tabs([
+    tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
         "✏️ 入力",
+        "📷 OCR読取",
         "📋 一覧",
         "📊 グラフ",
         "💾 エクスポート",
-        "⚙️ 設定"
+        "⚙️ 設定",
     ])
 
     with tab1:
         show_input_tab(year, month)
 
     with tab2:
-        show_list_tab(year, month)
+        show_ocr_tab(year, month)
 
     with tab3:
-        show_charts_tab(year, month)
+        show_list_tab(year, month)
 
     with tab4:
-        show_export_tab(year, month)
+        show_charts_tab(year, month)
 
     with tab5:
+        show_export_tab(year, month)
+
+    with tab6:
         show_settings_tab(year, month)
 
 
