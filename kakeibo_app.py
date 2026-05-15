@@ -49,124 +49,11 @@ MEDIA_TYPE_MAP = {
 # ─────────────────────────────────────────────
 
 def inject_css():
+    """Minimal mobile-friendly styling."""
     st.markdown("""
     <style>
-        /* Mobile-friendly touch targets */
-        .stButton > button {
-            min-height: 48px;
-            font-size: 16px;
-            border-radius: 8px;
-            font-weight: 500;
-            transition: all 0.2s ease;
-        }
-        .stButton > button:hover {
-            transform: translateY(-1px);
-            box-shadow: 0 4px 12px rgba(0,0,0,0.15);
-        }
-
-        /* Full-width form buttons */
-        [data-testid="stForm"] .stButton > button {
-            width: 100%;
-        }
-
-        /* Quick amount buttons */
-        .quick-btn-row {
-            display: flex;
-            flex-wrap: wrap;
-            gap: 6px;
-            margin: 8px 0;
-        }
-
-        /* Card-style metrics */
-        [data-testid="metric-container"] {
-            background: linear-gradient(135deg, #f8f9fa 0%, #ffffff 100%);
-            border: 1px solid #e0e0e0;
-            border-radius: 12px;
-            padding: 16px;
-            box-shadow: 0 2px 8px rgba(0,0,0,0.08);
-        }
-        [data-testid="stMetricLabel"] {
-            font-size: 13px !important;
-            font-weight: 600;
-        }
-        [data-testid="stMetricValue"] {
-            font-size: 22px !important;
-        }
-
-        /* PIN lock screen */
-        .pin-container {
-            max-width: 320px;
-            margin: 80px auto;
-            padding: 40px;
-            background: white;
-            border-radius: 16px;
-            box-shadow: 0 8px 32px rgba(0,0,0,0.12);
-            text-align: center;
-        }
-        .pin-title {
-            font-size: 28px;
-            font-weight: 700;
-            margin-bottom: 8px;
-            color: #1a1a2e;
-        }
-        .pin-subtitle {
-            color: #666;
-            margin-bottom: 24px;
-            font-size: 14px;
-        }
-
-        /* Danger zone */
-        .danger-zone {
-            border: 2px solid #ff4b4b;
-            border-radius: 8px;
-            padding: 16px;
-            background: #fff5f5;
-        }
-
-        /* Tab styling */
-        .stTabs [data-baseweb="tab-list"] {
-            gap: 4px;
-        }
-        .stTabs [data-baseweb="tab"] {
-            height: 44px;
-            font-size: 15px;
-            border-radius: 8px 8px 0 0;
-        }
-
-        /* Responsive layout */
-        @media (max-width: 768px) {
-            .stButton > button {
-                min-height: 52px;
-                font-size: 17px;
-            }
-            [data-testid="stMetricValue"] {
-                font-size: 20px !important;
-            }
-        }
-
-        /* Balance positive/negative color */
-        .balance-positive { color: #00c851; font-weight: 700; }
-        .balance-negative { color: #ff4444; font-weight: 700; }
-
-        /* Section headers */
-        .section-header {
-            font-size: 18px;
-            font-weight: 700;
-            color: #1a1a2e;
-            border-left: 4px solid #667eea;
-            padding-left: 12px;
-            margin: 16px 0 12px 0;
-        }
-
-        /* Info card */
-        .info-card {
-            background: #f0f4ff;
-            border: 1px solid #c0ccff;
-            border-radius: 8px;
-            padding: 12px 16px;
-            margin: 8px 0;
-            font-size: 14px;
-        }
+        .stButton > button { min-height: 44px; }
+        [data-testid="stForm"] .stButton > button { width: 100%; }
     </style>
     """, unsafe_allow_html=True)
 
@@ -701,35 +588,19 @@ _DUMMY_OCR_RESULT = {
 
 def show_pin_lock_screen():
     inject_css()
-    st.markdown("""
-    <div style="display:flex;justify-content:center;align-items:center;min-height:70vh;">
-    <div style="text-align:center;max-width:320px;width:100%;padding:40px;
-                background:white;border-radius:16px;
-                box-shadow:0 8px 32px rgba(0,0,0,0.12);">
-        <div style="font-size:48px;margin-bottom:12px;">🔐</div>
-        <div style="font-size:24px;font-weight:700;color:#1a1a2e;margin-bottom:6px;">家計簿</div>
-        <div style="color:#666;font-size:14px;margin-bottom:24px;">PINを入力してください</div>
-    </div>
-    </div>
-    """, unsafe_allow_html=True)
-
-    col1, col2, col3 = st.columns([1, 2, 1])
-    with col2:
-        pin_input = st.text_input(
-            "PIN", type="password", max_chars=4,
-            placeholder="4桁のPIN",
-            label_visibility="collapsed"
-        )
-        if st.button("🔓 ロック解除", use_container_width=True, type="primary"):
-            if verify_pin(pin_input):
-                st.session_state.authenticated = True
-                st.rerun()
-            else:
-                st.error("PINが違います。もう一度お試しください。")
+    st.title("🔐 家計簿")
+    st.caption("PINを入力してください")
+    pin_input = st.text_input("PIN", type="password", max_chars=4, placeholder="4桁のPIN")
+    if st.button("ロック解除", type="primary"):
+        if verify_pin(pin_input):
+            st.session_state.authenticated = True
+            st.rerun()
+        else:
+            st.error("PINが違います。")
 
 
 def show_input_tab(year: int, month: int):
-    st.markdown('<div class="section-header">✏️ 収支を入力</div>', unsafe_allow_html=True)
+    st.subheader("✏️ 収支を入力")
 
     # Initialise quick-add accumulator in session state
     if "quick_add_total" not in st.session_state:
@@ -787,29 +658,19 @@ def show_input_tab(year: int, month: int):
             st.rerun()
 
     # Recent entries
-    st.markdown('<div class="section-header">最近の登録 (5件)</div>', unsafe_allow_html=True)
+    st.subheader("最近の登録 (5件)")
     recent = get_recent_transactions(5)
     if recent.empty:
         st.info("まだ登録がありません。")
     else:
-        for _, row in recent.iterrows():
-            amt_str = f"¥{int(row['amount']):,}"
-            color = "#ff4444" if row["type"] == "支出" else "#00c851"
-            sign = "-" if row["type"] == "支出" else "+"
-            memo_text = f" — {row['memo']}" if row.get("memo") else ""
-            st.markdown(
-                f"<div style='padding:8px 12px;margin:4px 0;background:#f8f9fa;border-radius:8px;"
-                f"border-left:4px solid {color};font-size:14px;'>"
-                f"<b>{row['date']}</b> {row['category']}"
-                f"<span style='float:right;color:{color};font-weight:700;'>{sign}{amt_str}</span>"
-                f"<br><span style='color:#999;font-size:12px;'>{memo_text}</span>"
-                f"</div>",
-                unsafe_allow_html=True
-            )
+        display = recent[["date", "type", "category", "amount", "memo"]].copy()
+        display.columns = ["日付", "種別", "カテゴリ", "金額", "メモ"]
+        display["金額"] = display["金額"].apply(lambda x: f"¥{int(x):,}")
+        st.dataframe(display, use_container_width=True, hide_index=True)
 
 
 def show_ocr_tab(year: int, month: int):
-    st.markdown('<div class="section-header">📷 レシートOCR読取</div>', unsafe_allow_html=True)
+    st.subheader("📷 レシートOCR読取")
     st.caption("レシートや領収書の写真をアップロードすると、AIが自動で情報を読み取ります。")
     st.markdown("**処理フロー:** 画像アップロード → Claude AI 解析 → 確認フォーム → DB登録")
 
@@ -935,7 +796,7 @@ def show_ocr_tab(year: int, month: int):
 
 
 def show_list_tab(year: int, month: int):
-    st.markdown('<div class="section-header">📋 取引一覧</div>', unsafe_allow_html=True)
+    st.subheader("📋 取引一覧")
 
     col1, col2 = st.columns(2)
     with col1:
@@ -982,7 +843,7 @@ def show_list_tab(year: int, month: int):
 
     # Delete section
     st.markdown("---")
-    st.markdown('<div class="section-header">削除</div>', unsafe_allow_html=True)
+    st.subheader("削除")
     st.caption("削除する取引を選択してください。")
 
     id_options = df["id"].tolist()
@@ -1021,7 +882,7 @@ def show_list_tab(year: int, month: int):
 
 
 def show_charts_tab(year: int, month: int):
-    st.markdown('<div class="section-header">📊 グラフ分析</div>', unsafe_allow_html=True)
+    st.subheader("📊 グラフ分析")
     st.caption(f"{year}年{month}月のデータを表示しています")
 
     chart_tab1, chart_tab2, chart_tab3 = st.tabs(["支出内訳", "日別収支", "累計収支"])
@@ -1034,7 +895,7 @@ def show_charts_tab(year: int, month: int):
 
 
 def show_export_tab(year: int, month: int):
-    st.markdown('<div class="section-header">💾 データエクスポート</div>', unsafe_allow_html=True)
+    st.subheader("💾 データエクスポート")
 
     period_option = st.selectbox(
         "期間を選択",
@@ -1125,7 +986,7 @@ def show_export_tab(year: int, month: int):
 
 
 def show_settings_tab(year: int, month: int):
-    st.markdown('<div class="section-header">⚙️ 設定</div>', unsafe_allow_html=True)
+    st.subheader("⚙️ 設定")
 
     set_tab1, set_tab2, set_tab3 = st.tabs(["🔐 PINロック", "🏷️ カテゴリ管理", "💿 データ管理"])
 
@@ -1233,12 +1094,8 @@ def show_settings_tab(year: int, month: int):
     # ── Data Management Tab ──
     with set_tab3:
         st.markdown("#### データ管理")
-        st.markdown(f"""
-        <div class="info-card">
-            📁 <b>DBファイル:</b> {DB_PATH}<br>
-            📊 <b>総レコード数:</b> {get_total_record_count():,} 件
-        </div>
-        """, unsafe_allow_html=True)
+        st.text(f"DBファイル: {DB_PATH}")
+        st.text(f"総レコード数: {get_total_record_count():,} 件")
 
         st.markdown("---")
         st.markdown("**⚠️ 危険ゾーン: データ削除**")
