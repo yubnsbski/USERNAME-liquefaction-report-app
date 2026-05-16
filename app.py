@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import date
 from typing import Dict, List, Optional, Tuple
 
 import streamlit as st
@@ -283,13 +284,13 @@ def main() -> None:
 
     st.subheader("カテゴリ別出力フォーマット")
     formatted_output = {
-        output_prefixes["date"]: "2026-05-16",
+        output_prefixes["date"]: date.today().isoformat(),
         output_prefixes["amount"]: "(入力データから抽出する想定)",
         output_prefixes["merchant"]: result.merchant_normalized,
         "category": assigned_category,
         "output_destination": output_destination,
     }
-    st.code(str(formatted_output), language="python")
+    st.json(formatted_output, expanded=True)
 
     st.subheader("スコア")
     if result.scores:
