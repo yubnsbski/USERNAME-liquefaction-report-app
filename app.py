@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 import streamlit as st
 
@@ -29,6 +29,17 @@ AMBIGUOUS_MERCHANTS: List[str] = [
     "ドンキホーテ",
     "メルカリ",
 ]
+
+
+
+DEFAULT_OUTPUT_DESTINATIONS: Dict[Category, str] = {
+    "食費": "家計簿/食費",
+    "日用品": "家計簿/日用品",
+    "交通": "家計簿/交通",
+    "医療": "家計簿/医療",
+    "教育": "家計簿/教育",
+    "要確認": "家計簿/要確認",
+}
 
 ITEM_KEYWORD_RULES: Dict[str, Category] = {
     "おにぎり": "食費",
@@ -179,6 +190,31 @@ def parse_items(text: str) -> List[str]:
     return [line.strip() for line in text.splitlines() if line.strip()]
 
 
+def build_output_destination_editor() -> Tuple[Dict[str, str], Dict[str, str]]:
+    st.subheader("カテゴリ別の出力先設定")
+    st.caption("カテゴリごとに保存先ラベルを編集できます。")
+
+    all_categories = sorted(set(MERCHANT_RULES.values()) | set(ITEM_KEYWORD_RULES.values()) | {"要確認"})
+    configured_destinations: Dict[str, str] = {}
+    for category in all_categories:
+        default_value = DEFAULT_OUTPUT_DESTINATIONS.get(category, f"家計簿/{category}")
+        configured_destinations[category] = st.text_input(
+            f"{category} の出力先",
+            value=default_value,
+            key=f"destination_{category}",
+        )
+
+    st.markdown("---")
+
+    configured_prefixes = {
+        "date": st.text_input("日付の出力ラベル", value="date", key="prefix_date"),
+        "amount": st.text_input("金額の出力ラベル", value="amount", key="prefix_amount"),
+        "merchant": st.text_input("取引先名の出力ラベル", value="merchant", key="prefix_merchant"),
+    }
+
+    return configured_destinations, configured_prefixes
+
+
 def main() -> None:
     st.set_page_config(page_title="家計簿分類デモ", layout="wide")
     st.title("家計簿レシート分類デモ")
@@ -207,6 +243,8 @@ def main() -> None:
             use_container_width=True,
         )
 
+    output_destinations, output_prefixes = build_output_destination_editor()
+
     with st.form("receipt_form"):
         merchant_raw = st.text_input("店舗名", "ｾﾌﾞﾝ-ｲﾚﾌﾞﾝ 渋谷店")
         items_text = st.text_area("明細。1行1品目", "おにぎり\n牛乳", height=140)
@@ -226,6 +264,9 @@ def main() -> None:
     col2.metric("信頼度", f"{result.confidence:.2f}")
     col3.metric("レビュー要否", "必要" if result.needs_review else "不要")
 
+    assigned_category = result.category or "要確認"
+    output_destination = output_destinations.get(assigned_category, f"家計簿/{assigned_category}")
+
     st.subheader("正規化結果")
     st.json(
         {
@@ -235,9 +276,20 @@ def main() -> None:
             "needs_review": result.needs_review,
             "reason": result.reason,
             "reasons": result.reasons,
+            "output_destination": output_destination,
         },
         ensure_ascii=False,
     )
+
+    st.subheader("カテゴリ別出力フォーマット")
+    formatted_output = {
+        output_prefixes["date"]: "2026-05-16",
+        output_prefixes["amount"]: "(入力データから抽出する想定)",
+        output_prefixes["merchant"]: result.merchant_normalized,
+        "category": assigned_category,
+        "output_destination": output_destination,
+    }
+    st.code(str(formatted_output), language="python")
 
     st.subheader("スコア")
     if result.scores:
