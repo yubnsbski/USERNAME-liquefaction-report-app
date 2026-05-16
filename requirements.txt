@@ -1,7 +1,1 @@
 streamlit
-pandas
-matplotlib
-fpdf2
-plotly
-openpyxl
-bcrypt
