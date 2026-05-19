@@ -337,3 +337,138 @@ class TestDummyOCRResult:
 
     def test_dummy_result_date_is_today(self):
         assert app._DUMMY_OCR_RESULT["date"] == date.today().isoformat()
+
+
+# ─────────────────────────────────────────────
+# ML — カテゴリ分類
+# ─────────────────────────────────────────────
+
+class TestMLCategoryClassifier:
+    @pytest.fixture()
+    def trained_db(self, tmp_paths):
+        """Seed enough varied transactions to train a classifier."""
+        records = [
+            ("2026-05-01", "支出", "食費",    1200, "スーパーで野菜"),
+            ("2026-05-02", "支出", "食費",     980, "コンビニ 弁当"),
+            ("2026-05-03", "支出", "食費",    1500, "スーパー 肉"),
+            ("2026-05-04", "支出", "交通費",    230, "電車代"),
+            ("2026-05-05", "支出", "交通費",    470, "バス 定期"),
+            ("2026-05-06", "支出", "交通費",    340, "電車 通勤"),
+            ("2026-05-07", "収入", "給与",  250000, "5月分給与"),
+            ("2026-05-08", "収入", "給与",  250000, "6月分給与"),
+            ("2026-05-09", "支出", "娯楽費",  2000, "映画チケット"),
+            ("2026-05-10", "支出", "娯楽費",  1500, "ゲーム"),
+        ]
+        for r in records:
+            app.add_transaction(*r)
+        return tmp_paths
+
+    def test_train_returns_pipeline(self, trained_db):
+        model = app.train_category_classifier()
+        assert model is not None
+
+    def test_predict_returns_known_category(self, trained_db):
+        model = app.train_category_classifier()
+        assert model is not None
+        proba = model.predict_proba(["電車代"])[0]
+        idx = proba.argmax()
+        pred = model.classes_[idx]
+        conf = float(proba[idx])
+        all_cat_names = [c["name"] for c in app.get_categories()]
+        assert pred in all_cat_names
+        assert 0.0 <= conf <= 1.0
+
+    def test_predict_empty_returns_none(self, trained_db):
+        # 空文字のときは (None, 0.0) を返すことを直接確認
+        pred, conf = app._ml_feature(""), 0.0
+        assert pred == ""  # _ml_feature は空文字を返す
+        assert conf == 0.0
+
+    def test_insufficient_data_returns_none(self, tmp_paths):
+        # Only 2 records — below min_samples=5
+        app.add_transaction("2026-05-01", "支出", "食費", 500, "テスト")
+        app.add_transaction("2026-05-02", "支出", "食費", 300, "テスト2")
+        model = app.train_category_classifier()
+        assert model is None
+
+    def test_single_category_returns_none(self, tmp_paths):
+        for i in range(6):
+            app.add_transaction(f"2026-05-{i+1:02d}", "支出", "食費", 500, f"テスト{i}")
+        model = app.train_category_classifier()
+        assert model is None  # 1カテゴリのみでは分類不可
+
+
+# ─────────────────────────────────────────────
+# ML — 支出予測
+# ─────────────────────────────────────────────
+
+class TestForecastExpenses:
+    @pytest.fixture()
+    def multi_month_db(self, tmp_paths):
+        records = [
+            ("2026-03-10", "支出", "食費", 30000, "3月"),
+            ("2026-04-10", "支出", "食費", 32000, "4月"),
+            ("2026-05-10", "支出", "食費", 34000, "5月"),
+            ("2026-03-15", "支出", "交通費", 5000, "3月"),
+            ("2026-04-15", "支出", "交通費", 5200, "4月"),
+            ("2026-05-15", "支出", "交通費", 5400, "5月"),
+        ]
+        for r in records:
+            app.add_transaction(*r)
+        return tmp_paths
+
+    def test_forecast_returns_dataframe(self, multi_month_db):
+        df = app.forecast_expenses_by_category()
+        assert isinstance(df, pd.DataFrame)
+        assert "カテゴリ" in df.columns
+        assert "予測金額" in df.columns
+
+    def test_forecast_covers_known_categories(self, multi_month_db):
+        df = app.forecast_expenses_by_category()
+        cats = df["カテゴリ"].tolist()
+        assert "食費" in cats
+        assert "交通費" in cats
+
+    def test_forecast_amounts_non_negative(self, multi_month_db):
+        df = app.forecast_expenses_by_category()
+        assert (df["予測金額"] >= 0).all()
+
+    def test_forecast_empty_db_returns_empty(self, tmp_paths):
+        df = app.forecast_expenses_by_category()
+        assert df.empty
+
+
+# ─────────────────────────────────────────────
+# ML — 異常支出検知
+# ─────────────────────────────────────────────
+
+class TestAnomalyDetection:
+    @pytest.fixture()
+    def anomaly_db(self, tmp_paths):
+        # 食費: 平均 ~1000円, 今月だけ 50000円（外れ値）
+        for i in range(1, 6):
+            app.add_transaction(f"2026-0{i}-10", "支出", "食費", 1000, "通常")
+        app.add_transaction("2026-05-20", "支出", "食費", 50000, "異常支出")
+        return tmp_paths
+
+    def test_detects_anomaly(self, anomaly_db):
+        flagged = app.detect_anomalies(2026, 5)
+        assert not flagged.empty
+        assert "食費" in flagged["category"].values
+
+    def test_z_score_is_high(self, anomaly_db):
+        flagged = app.detect_anomalies(2026, 5)
+        assert flagged["z_score"].max() >= 2.0
+
+    def test_no_anomaly_returns_empty(self, tmp_paths):
+        for i in range(1, 6):
+            app.add_transaction(f"2026-0{i}-10", "支出", "食費", 1000, "通常")
+        # 今月も同額 → 外れ値なし
+        app.add_transaction("2026-05-20", "支出", "食費", 1000, "通常")
+        flagged = app.detect_anomalies(2026, 5)
+        assert flagged.empty
+
+    def test_columns_present(self, anomaly_db):
+        flagged = app.detect_anomalies(2026, 5)
+        for col in ["date", "category", "amount", "memo", "z_score"]:
+            assert col in flagged.columns

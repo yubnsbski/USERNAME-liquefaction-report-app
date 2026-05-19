@@ -583,6 +583,122 @@ _DUMMY_OCR_RESULT = {
 
 
 # ─────────────────────────────────────────────
+# Machine Learning Functions
+# ─────────────────────────────────────────────
+
+def _ml_feature(text: str) -> str:
+    """Combine memo and any extra context into a single feature string."""
+    return (text or "").strip()
+
+
+def train_category_classifier():
+    """
+    Train a TF-IDF + Logistic Regression pipeline on existing transaction memos.
+    Returns the fitted pipeline or None if not enough data.
+    """
+    from sklearn.feature_extraction.text import TfidfVectorizer
+    from sklearn.linear_model import LogisticRegression
+    from sklearn.pipeline import Pipeline
+
+    df = get_transactions()
+    if df.empty or len(df) < 5 or df["category"].nunique() < 2:
+        return None
+
+    X = df["memo"].fillna("").astype(str)
+    y = df["category"]
+
+    pipeline = Pipeline([
+        # char n-grams work well for Japanese without tokenization
+        ("tfidf", TfidfVectorizer(analyzer="char_wb", ngram_range=(2, 4), min_df=1)),
+        ("clf", LogisticRegression(max_iter=1000, C=1.0)),
+    ])
+    try:
+        pipeline.fit(X, y)
+        return pipeline
+    except Exception:
+        return None
+
+
+def get_ml_model():
+    """Return cached model from session_state, training if needed."""
+    if "ml_model" not in st.session_state or st.session_state.get("ml_retrain"):
+        st.session_state["ml_model"] = train_category_classifier()
+        st.session_state["ml_retrain"] = False
+    return st.session_state["ml_model"]
+
+
+def predict_category_ml(memo: str) -> tuple[str | None, float]:
+    """Return (predicted_category, confidence) or (None, 0.0) if unavailable."""
+    model = get_ml_model()
+    if not model or not memo.strip():
+        return None, 0.0
+    proba = model.predict_proba([memo])[0]
+    idx = int(proba.argmax())
+    return model.classes_[idx], float(proba[idx])
+
+
+def forecast_expenses_by_category() -> pd.DataFrame:
+    """
+    Predict next month's spend per category using per-category linear regression
+    on monthly totals. Returns a DataFrame with columns [category, predicted_amount].
+    """
+    from sklearn.linear_model import LinearRegression
+    import numpy as np
+
+    df = get_transactions()
+    exp = df[df["type"] == "支出"].copy()
+    if exp.empty:
+        return pd.DataFrame(columns=["カテゴリ", "予測金額"])
+
+    exp["period"] = pd.to_datetime(exp["date"]).dt.to_period("M")
+    exp["period_ord"] = exp["period"].apply(lambda p: p.ordinal)
+
+    results = []
+    for cat, grp in exp.groupby("category"):
+        monthly = grp.groupby("period_ord")["amount"].sum().reset_index()
+        if len(monthly) < 2:
+            results.append({"カテゴリ": cat, "予測金額": int(grp["amount"].mean())})
+            continue
+        X = monthly["period_ord"].values.reshape(-1, 1)
+        y = monthly["amount"].values
+        reg = LinearRegression().fit(X, y)
+        next_ord = int(monthly["period_ord"].max()) + 1
+        pred = max(0, int(reg.predict([[next_ord]])[0]))
+        results.append({"カテゴリ": cat, "予測金額": pred})
+
+    return pd.DataFrame(results).sort_values("予測金額", ascending=False)
+
+
+def detect_anomalies(year: int, month: int) -> pd.DataFrame:
+    """
+    Flag transactions whose amount is more than 2 standard deviations
+    above the mean for that category (using all historical data as baseline).
+    Returns the flagged rows with an extra 'z_score' column.
+    """
+    import numpy as np
+
+    all_df = get_transactions()
+    if all_df.empty:
+        return pd.DataFrame()
+
+    # Compute per-category mean/std from all historical data
+    stats = all_df.groupby("category")["amount"].agg(["mean", "std"]).reset_index()
+    stats.columns = ["category", "mean", "std"]
+    stats["std"] = stats["std"].fillna(0)
+
+    month_df = get_transactions(year=year, month=month)
+    if month_df.empty:
+        return pd.DataFrame()
+
+    merged = month_df.merge(stats, on="category", how="left")
+    merged["z_score"] = merged.apply(
+        lambda r: (r["amount"] - r["mean"]) / r["std"] if r["std"] > 0 else 0, axis=1
+    )
+    flagged = merged[merged["z_score"] >= 2.0].copy()
+    return flagged[["date", "category", "amount", "memo", "z_score"]].sort_values("z_score", ascending=False)
+
+
+# ─────────────────────────────────────────────
 # UI Sections
 # ─────────────────────────────────────────────
 
@@ -602,12 +718,20 @@ def show_pin_lock_screen():
 def show_input_tab(year: int, month: int):
     st.subheader("✏️ 収支を入力")
 
-    # Initialise quick-add accumulator in session state
     if "quick_add_total" not in st.session_state:
         st.session_state.quick_add_total = 0
 
-    # Quick-amount buttons outside the form so they can mutate state
-    st.markdown("**クイック追加** (フォームの金額に加算されます)")
+    # ── フォーム外: メモ入力でMLカテゴリ予測 ──
+    memo_preview = st.text_input(
+        "メモ（カテゴリをAIが予測します）",
+        placeholder="例: スーパーで購入、電車代",
+        key="memo_preview",
+    )
+    pred_cat, pred_conf = predict_category_ml(memo_preview)
+    if pred_cat:
+        st.caption(f"🤖 AI予測カテゴリ: **{pred_cat}** (信頼度 {pred_conf:.0%})")
+
+    st.markdown("**クイック追加**")
     q_cols = st.columns(len(QUICK_AMOUNTS))
     for i, amt in enumerate(QUICK_AMOUNTS):
         with q_cols[i]:
@@ -616,7 +740,7 @@ def show_input_tab(year: int, month: int):
                 st.rerun()
 
     if st.session_state.quick_add_total > 0:
-        st.info(f"クイック追加累計: ¥{st.session_state.quick_add_total:,}  （登録ボタンを押すと反映されます）")
+        st.info(f"クイック追加累計: ¥{st.session_state.quick_add_total:,}")
 
     with st.form("input_form", clear_on_submit=True):
         col1, col2 = st.columns(2)
@@ -626,18 +750,20 @@ def show_input_tab(year: int, month: int):
             tx_date = st.date_input("日付", value=date.today(), key="form_date")
 
         categories = get_categories(tx_type)
-        category = st.selectbox("カテゴリ", categories, key="form_category")
+        # AI予測カテゴリを初期選択に反映
+        default_idx = categories.index(pred_cat) if pred_cat in categories else 0
+        category = st.selectbox("カテゴリ", categories, index=default_idx, key="form_category")
 
         amount = st.number_input(
-            "金額 (円)",
-            min_value=0,
-            step=100,
-            format="%d",
-            key="form_amount",
-            help="直接入力、またはクイック追加ボタンで金額を加算できます"
+            "金額 (円)", min_value=0, step=100, format="%d", key="form_amount",
         )
 
-        memo = st.text_input("メモ (任意)", placeholder="例: スーパーで購入", key="form_memo")
+        memo = st.text_input(
+            "メモ（フォーム用）",
+            value=memo_preview,
+            placeholder="例: スーパーで購入",
+            key="form_memo",
+        )
 
         submitted = st.form_submit_button("💾 登録", type="primary", use_container_width=True)
 
@@ -649,6 +775,7 @@ def show_input_tab(year: int, month: int):
                 if add_transaction(str(tx_date), tx_type, category, final_amount, memo):
                     st.success(f"✅ 登録完了: {tx_type} {category} ¥{final_amount:,}")
                     st.session_state.quick_add_total = 0
+                    st.session_state["ml_retrain"] = True  # 新データで再学習フラグ
                     st.rerun()
 
     # Reset quick-add button
@@ -751,15 +878,28 @@ def show_ocr_tab(year: int, month: int):
                 ocr_date = date.today()
             tx_date = st.date_input("日付", value=ocr_date, key="ocr_date")
 
-        # カテゴリは種別に連動（AIの提案を初期選択）
+        # カテゴリ：OCR提案 → ML予測 → フォールバックの優先順
         cats = get_categories(tx_type)
-        suggested = result.get("category", "")
-        default_idx = cats.index(suggested) if suggested in cats else 0
+        ocr_suggested = result.get("category", "")
+        memo_for_ml = result.get("memo") or result.get("store_name") or ""
+        ml_cat, ml_conf = predict_category_ml(memo_for_ml)
+
+        if ocr_suggested in cats:
+            default_idx = cats.index(ocr_suggested)
+            cat_hint = f"Claude OCR提案: {ocr_suggested}"
+        elif ml_cat and ml_cat in cats:
+            default_idx = cats.index(ml_cat)
+            cat_hint = f"🤖 ML予測: {ml_cat} ({ml_conf:.0%})"
+        else:
+            default_idx = 0
+            cat_hint = ""
+
         category = st.selectbox(
-            "カテゴリ（AIの提案から選択・変更可）",
+            "カテゴリ",
             cats,
             index=default_idx,
             key="ocr_category",
+            help=cat_hint,
         )
 
         amount = st.number_input(
@@ -1127,6 +1267,78 @@ def show_settings_tab(year: int, month: int):
                         st.rerun()
 
 
+def show_ml_tab(year: int, month: int):
+    st.subheader("🤖 ML分析")
+
+    total = get_total_record_count()
+    if total < 5:
+        st.info(f"ML機能を使うには最低5件のデータが必要です（現在 {total} 件）。まず取引を登録してください。")
+        return
+
+    model = get_ml_model()
+
+    # ── 1. カテゴリ予測テスト ──
+    st.markdown("#### カテゴリ予測テスト")
+    st.caption("メモを入力すると、過去のデータから最適なカテゴリを予測します。")
+    test_memo = st.text_input("メモを入力", placeholder="例: コンビニ、ガス代、映画", key="ml_test_memo")
+    if test_memo:
+        if model:
+            proba = model.predict_proba([test_memo])[0]
+            top_n = min(3, len(model.classes_))
+            top_idx = proba.argsort()[::-1][:top_n]
+            for rank, idx in enumerate(top_idx, 1):
+                bar = "█" * int(proba[idx] * 20)
+                st.write(f"{rank}位 **{model.classes_[idx]}** {proba[idx]:.0%}  `{bar}`")
+        else:
+            st.warning("モデルを学習できませんでした（データのカテゴリが1種類のみの可能性があります）。")
+
+    if st.button("🔄 モデルを再学習", key="ml_retrain_btn"):
+        st.session_state["ml_retrain"] = True
+        get_ml_model()
+        st.success("再学習完了。")
+
+    st.markdown("---")
+
+    # ── 2. 来月の支出予測 ──
+    st.markdown("#### 来月の支出予測")
+    st.caption("カテゴリごとの月次推移から線形回帰で予測します。")
+    forecast_df = forecast_expenses_by_category()
+    if forecast_df.empty:
+        st.info("予測に十分な支出データがありません。")
+    else:
+        total_forecast = int(forecast_df["予測金額"].sum())
+        st.metric("来月 合計予測支出", f"¥{total_forecast:,}")
+        fig = px.bar(
+            forecast_df,
+            x="カテゴリ", y="予測金額",
+            labels={"予測金額": "予測金額（円）"},
+            color="予測金額",
+            color_continuous_scale="Blues",
+        )
+        fig.update_layout(showlegend=False, height=350, margin=dict(t=20, b=40))
+        st.plotly_chart(fig, use_container_width=True)
+
+    st.markdown("---")
+
+    # ── 3. 異常支出検知 ──
+    st.markdown(f"#### 異常支出検知（{year}年{month}月）")
+    st.caption("過去の平均から2σ以上外れた取引をフラグします。")
+    anomalies = detect_anomalies(year, month)
+    if anomalies.empty:
+        st.success("今月の異常支出は検出されませんでした。")
+    else:
+        display = anomalies.copy()
+        display["金額"] = display["amount"].apply(lambda x: f"¥{int(x):,}")
+        display["外れ度"] = display["z_score"].apply(lambda z: f"{z:.1f}σ")
+        st.warning(f"{len(display)} 件の異常支出を検出しました。")
+        st.dataframe(
+            display[["date", "category", "金額", "memo", "外れ度"]].rename(
+                columns={"date": "日付", "category": "カテゴリ", "memo": "メモ"}
+            ),
+            use_container_width=True, hide_index=True,
+        )
+
+
 def show_sidebar() -> tuple:
     with st.sidebar:
         st.markdown("# 🏠 家計簿")
@@ -1224,11 +1436,12 @@ def main():
     year, month = show_sidebar()
 
     # Main tab navigation
-    tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
+    tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs([
         "✏️ 入力",
         "📷 OCR読取",
         "📋 一覧",
         "📊 グラフ",
+        "🤖 ML分析",
         "💾 エクスポート",
         "⚙️ 設定",
     ])
@@ -1246,9 +1459,12 @@ def main():
         show_charts_tab(year, month)
 
     with tab5:
-        show_export_tab(year, month)
+        show_ml_tab(year, month)
 
     with tab6:
+        show_export_tab(year, month)
+
+    with tab7:
         show_settings_tab(year, month)
 
 
