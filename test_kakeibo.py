@@ -228,8 +228,18 @@ class TestExport:
     @pytest.fixture()
     def sample_df(self):
         return pd.DataFrame([
-            {"id": 1, "date": "2026-05-01", "type": "支出", "category": "食費", "amount": 980, "memo": "スーパー", "created_at": ""},
-            {"id": 2, "date": "2026-05-02", "type": "収入", "category": "給与", "amount": 200000, "memo": "", "created_at": ""},
+            {"id": 1, "date": "2026-05-01", "type": "支出", "account": "現金",
+             "category": "食費", "amount": 980, "memo": "スーパー", "created_at": ""},
+            {"id": 2, "date": "2026-05-02", "type": "収入", "account": "銀行口座",
+             "category": "給与", "amount": 200000, "memo": "", "created_at": ""},
+        ])
+
+    @pytest.fixture()
+    def sample_df_no_account(self):
+        """Backward compat: DataFrame without account column."""
+        return pd.DataFrame([
+            {"id": 1, "date": "2026-05-01", "type": "支出",
+             "category": "食費", "amount": 980, "memo": "テスト", "created_at": ""},
         ])
 
     def test_csv_starts_with_utf8_bom(self, sample_df):
@@ -242,21 +252,41 @@ class TestExport:
         assert "日付" in text
         assert "金額" in text
         assert "カテゴリ" in text
+        assert "口座" in text  # account column present
+
+    def test_csv_includes_account_column(self, sample_df):
+        text = app.df_to_csv_bytes(sample_df).decode("utf-8-sig")
+        assert "現金" in text
+        assert "銀行口座" in text
 
     def test_csv_row_count(self, sample_df):
         data = app.df_to_csv_bytes(sample_df)
         lines = data.decode("utf-8-sig").strip().split("\n")
         assert len(lines) == 3  # header + 2 rows
 
+    def test_csv_without_account_column_works(self, sample_df_no_account):
+        data = app.df_to_csv_bytes(sample_df_no_account)
+        text = data.decode("utf-8-sig")
+        assert "日付" in text
+        assert "口座" not in text  # gracefully omitted
+
     def test_excel_bytes_non_empty(self, sample_df):
         data = app.df_to_excel_bytes(sample_df, "2026年5月")
-        assert len(data) > 1000  # valid xlsx is never tiny
+        assert len(data) > 1000
 
     def test_excel_is_valid_xlsx(self, sample_df):
         import openpyxl, io
         data = app.df_to_excel_bytes(sample_df, "テスト")
         wb = openpyxl.load_workbook(io.BytesIO(data))
         assert "家計簿データ" in wb.sheetnames
+
+    def test_excel_includes_account_header(self, sample_df):
+        import openpyxl, io
+        data = app.df_to_excel_bytes(sample_df, "テスト")
+        wb = openpyxl.load_workbook(io.BytesIO(data))
+        ws = wb.active
+        headers = [ws.cell(row=2, column=i).value for i in range(1, 7)]
+        assert "口座" in headers
 
 
 # ─────────────────────────────────────────────

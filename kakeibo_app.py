@@ -639,16 +639,24 @@ def chart_cumulative_line(year: int, month: int):
 # Export Functions
 # ─────────────────────────────────────────────
 
+def _export_cols(df: pd.DataFrame) -> pd.DataFrame:
+    """Select and rename columns for export, including account if present."""
+    cols = ["date", "type", "account", "category", "amount", "memo"]
+    cols = [c for c in cols if c in df.columns]
+    out = df[cols].copy()
+    rename = {"date": "日付", "type": "種別", "account": "口座",
+               "category": "カテゴリ", "amount": "金額", "memo": "メモ"}
+    out.columns = [rename[c] for c in cols]
+    return out
+
+
 def df_to_csv_bytes(df: pd.DataFrame) -> bytes:
-    export_df = df[["date", "type", "category", "amount", "memo"]].copy()
-    export_df.columns = ["日付", "種別", "カテゴリ", "金額", "メモ"]
-    # UTF-8 BOM for Excel compatibility
+    export_df = _export_cols(df)
     return b"\xef\xbb\xbf" + export_df.to_csv(index=False).encode("utf-8")
 
 
 def df_to_excel_bytes(df: pd.DataFrame, period_label: str = "") -> bytes:
-    export_df = df[["date", "type", "category", "amount", "memo"]].copy()
-    export_df.columns = ["日付", "種別", "カテゴリ", "金額", "メモ"]
+    export_df = _export_cols(df)
 
     wb = openpyxl.Workbook()
     ws = wb.active
@@ -686,9 +694,12 @@ def df_to_excel_bytes(df: pd.DataFrame, period_label: str = "") -> bytes:
             cell = ws.cell(row=row_idx, column=col_idx, value=value)
             cell.border = thin_border
             cell.alignment = Alignment(vertical="center")
-            if col_idx == 4:  # Amount column
+            # 金額列のインデックスを動的に解決
+            amt_idx = list(export_df.columns).index("金額") + 1
+            if col_idx == amt_idx:
                 cell.number_format = "#,##0"
-                if row[1] == "支出":
+                type_idx = list(export_df.columns).index("種別")
+                if row[type_idx] == "支出":
                     cell.font = Font(color="CC0000")
                 else:
                     cell.font = Font(color="006600")
@@ -714,10 +725,10 @@ def df_to_excel_bytes(df: pd.DataFrame, period_label: str = "") -> bytes:
         cell.number_format = "#,##0"
         cell.font = Font(color=color, bold=True)
 
-    # Column widths
-    col_widths = [14, 8, 14, 14, 30]
-    for i, width in enumerate(col_widths, 1):
-        ws.column_dimensions[get_column_letter(i)].width = width
+    # Column widths (account column added if present)
+    base_widths = {"日付": 14, "種別": 8, "口座": 16, "カテゴリ": 14, "金額": 14, "メモ": 30}
+    for i, col_name in enumerate(export_df.columns, 1):
+        ws.column_dimensions[get_column_letter(i)].width = base_widths.get(col_name, 14)
 
     output = io.BytesIO()
     wb.save(output)
@@ -1161,6 +1172,8 @@ def show_ocr_tab(year: int, month: int):
         memo_default = result.get("memo") or result.get("store_name") or ""
         memo = st.text_input("メモ", value=memo_default, key="ocr_memo")
 
+        ocr_account = st.selectbox("口座", get_account_names(), key="ocr_account")
+
         col_reg, col_clear = st.columns(2)
         with col_reg:
             submitted = st.form_submit_button("💾 登録", type="primary", use_container_width=True)
@@ -1170,7 +1183,7 @@ def show_ocr_tab(year: int, month: int):
         if submitted:
             if amount <= 0:
                 st.error("金額は1円以上入力してください。")
-            elif add_transaction(str(tx_date), tx_type, category, int(amount), memo):
+            elif add_transaction(str(tx_date), tx_type, category, int(amount), memo, ocr_account):
                 st.success(f"✅ 登録完了: {tx_type} {category} ¥{int(amount):,}")
                 st.session_state.pop("ocr_result", None)
                 st.session_state.pop("ocr_source", None)
