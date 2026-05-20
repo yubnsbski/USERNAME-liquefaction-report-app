@@ -160,21 +160,86 @@ with tabs[1]:
         st.error(f"カテゴリ/口座の取得失敗: {e}")
         categories, accounts = [], ["現金"]
 
+    # ── レシート画像から自動入力 ─────────────────────────────────────────────
+    with st.expander("📷 レシート画像から自動入力"):
+        receipt_img = st.file_uploader(
+            "レシート画像をドロップ / クリックして選択",
+            type=["png", "jpg", "jpeg", "webp"],
+            key="tab1_receipt",
+            label_visibility="collapsed",
+        )
+        dummy_mode_tab1 = st.checkbox("ダミーモード（APIキー不要）", key="tab1_dummy")
+
+        if receipt_img is not None:
+            img_col, info_col = st.columns([1, 2])
+            img_col.image(receipt_img, width=180)
+
+            # Auto-OCR on new upload
+            if st.session_state.get("_tab1_file_id") != receipt_img.file_id:
+                st.session_state["_tab1_file_id"] = receipt_img.file_id
+                st.session_state.pop("_tab1_prefill", None)
+                with st.spinner("AI解析中..."):
+                    try:
+                        if dummy_mode_tab1:
+                            parsed = {
+                                "store": "サンプルストア", "date": str(today),
+                                "total": 1580, "category": "食費",
+                            }
+                        else:
+                            parsed = api.ocr_receipt(receipt_img.getvalue(), receipt_img.name)
+                        st.session_state["_tab1_prefill"] = parsed
+                    except Exception as e:
+                        info_col.error(f"OCR失敗: {e}")
+
+            if "_tab1_prefill" in st.session_state:
+                p = st.session_state["_tab1_prefill"]
+                info_col.success(
+                    f"**店舗**: {p.get('store','不明')}  \n"
+                    f"**日付**: {p.get('date', str(today))}  \n"
+                    f"**金額**: ¥{p.get('total', p.get('amount', 0)):,}  \n"
+                    f"**カテゴリ**: {p.get('category','食費')}"
+                )
+                if info_col.button("↓ フォームに反映", type="primary"):
+                    st.session_state["_prefill_date"] = p.get("date", str(today))
+                    st.session_state["_prefill_amount"] = int(p.get("total", p.get("amount", 1000)))
+                    st.session_state["_prefill_memo"] = str(p.get("store", p.get("memo", "")))
+                    st.session_state["_prefill_category"] = p.get("category", "")
+                    st.rerun()
+
+    # ── 入力フォーム ─────────────────────────────────────────────────────────
+    # Read prefill values (cleared after form submit)
+    _pre_date = st.session_state.get("_prefill_date", str(today))
+    _pre_amount = st.session_state.get("_prefill_amount", 1000)
+    _pre_memo = st.session_state.get("_prefill_memo", "")
+    _pre_category = st.session_state.get("_prefill_category", "")
+
+    try:
+        _pre_date_parsed = date.fromisoformat(_pre_date)
+    except ValueError:
+        _pre_date_parsed = today
+
     with st.form("add_tx", clear_on_submit=True):
         r1c1, r1c2, r1c3 = st.columns(3)
-        tx_date = r1c1.date_input("日付", value=today)
+        tx_date = r1c1.date_input("日付", value=_pre_date_parsed)
         tx_type = r1c2.selectbox("種類", ["支出", "収入"])
         tx_account = r1c3.selectbox("口座", accounts if accounts else ["現金"])
 
         filtered_cats = [c["name"] for c in categories if c["type"] == tx_type]
+        default_cat_idx = 0
+        if _pre_category and _pre_category in filtered_cats:
+            default_cat_idx = filtered_cats.index(_pre_category)
         r2c1, r2c2 = st.columns(2)
-        tx_cat = r2c1.selectbox("カテゴリ", filtered_cats if filtered_cats else ["その他"])
-        tx_amount = r2c2.number_input("金額 (円)", min_value=1, step=100, value=1000)
+        tx_cat = r2c1.selectbox("カテゴリ", filtered_cats if filtered_cats else ["その他"],
+                                 index=default_cat_idx)
+        tx_amount = r2c2.number_input("金額 (円)", min_value=1, step=100, value=_pre_amount)
 
-        tx_memo = st.text_input("メモ")
+        tx_memo = st.text_input("メモ", value=_pre_memo)
         submitted = st.form_submit_button("追加", type="primary", use_container_width=True)
 
     if submitted:
+        # Clear prefill on submit
+        for k in ["_prefill_date", "_prefill_amount", "_prefill_memo", "_prefill_category"]:
+            st.session_state.pop(k, None)
         try:
             api.add_transaction(
                 date=str(tx_date), type=tx_type, category=tx_cat,
@@ -215,73 +280,105 @@ with tabs[1]:
 # TAB 2 — OCR読取
 # ════════════════════════════════════════════════════════════════════════════
 
+_DUMMY_OCR = {
+    "store": "サンプルストア",
+    "date": str(today),
+    "total": 1580,
+    "category": "食費",
+    "items": [
+        {"品目": "牛乳", "金額": 198},
+        {"品目": "パン", "金額": 150},
+        {"品目": "卵", "金額": 298},
+        {"品目": "野菜セット", "金額": 534},
+        {"品目": "お菓子", "金額": 400},
+    ],
+}
+
 with tabs[2]:
     st.subheader("レシートOCR読取")
-    st.info("画像をアップロードするとAIがレシートを解析し、取引候補を提示します。")
 
-    uploaded = st.file_uploader("レシート画像", type=["png", "jpg", "jpeg", "webp"])
-    dummy_mode = st.checkbox("ダミーモード（APIキー不要）")
+    ocr_top_l, ocr_top_r = st.columns([3, 1])
+    with ocr_top_r:
+        dummy_mode = st.checkbox("ダミーモード", help="ANTHROPIC_API_KEY 不要のテスト用")
 
-    if uploaded:
-        st.image(uploaded, caption="アップロード画像", width=300)
-        if st.button("OCR実行", type="primary"):
-            with st.spinner("AIが解析中..."):
+    uploaded = ocr_top_l.file_uploader(
+        "レシート画像をドロップ / クリックして選択（PNG・JPG・WEBP）",
+        type=["png", "jpg", "jpeg", "webp"],
+        label_visibility="collapsed",
+    )
+
+    if uploaded is not None:
+        # Auto-OCR: detect new file by file_id
+        if st.session_state.get("_ocr2_file_id") != uploaded.file_id:
+            st.session_state["_ocr2_file_id"] = uploaded.file_id
+            st.session_state.pop("ocr_result", None)
+            with st.spinner("AI解析中... しばらくお待ちください"):
                 try:
                     if dummy_mode:
-                        ocr_result = {
-                            "store": "サンプルストア",
-                            "date": str(today),
-                            "total": 1580,
-                            "items": [
-                                {"name": "牛乳", "amount": 198},
-                                {"name": "パン", "amount": 150},
-                                {"name": "卵", "amount": 298},
-                                {"name": "野菜セット", "amount": 534},
-                                {"name": "お菓子", "amount": 400},
-                            ],
-                        }
+                        st.session_state["ocr_result"] = _DUMMY_OCR
                     else:
-                        ocr_result = api.ocr_receipt(uploaded.read(), uploaded.name)
-                    st.session_state["ocr_result"] = ocr_result
-                    st.success("解析完了")
+                        st.session_state["ocr_result"] = api.ocr_receipt(
+                            uploaded.getvalue(), uploaded.name)
                 except Exception as e:
                     st.error(f"OCR失敗: {e}")
 
-    if "ocr_result" in st.session_state:
-        res = st.session_state["ocr_result"]
-        st.markdown(f"**店舗**: {res.get('store','不明')} / **日付**: {res.get('date', str(today))} / **合計**: ¥{res.get('total', 0):,}")
+        # Show image + result side by side
+        img_col, res_col = st.columns([1, 2])
+        img_col.image(uploaded, use_container_width=True)
 
-        items = res.get("items", [])
-        if items:
-            idf = pd.DataFrame(items)
-            st.dataframe(idf, use_container_width=True, hide_index=True)
+        if "ocr_result" in st.session_state:
+            res = st.session_state["ocr_result"]
+            with res_col:
+                st.success("解析完了")
+                st.markdown(
+                    f"**店舗**: {res.get('store', '不明')}  \n"
+                    f"**日付**: {res.get('date', str(today))}  \n"
+                    f"**合計**: ¥{res.get('total', res.get('amount', 0)):,}"
+                )
+                items = res.get("items", [])
+                if items:
+                    st.dataframe(pd.DataFrame(items), use_container_width=True, hide_index=True)
 
-        st.markdown("#### 取引として登録")
-        try:
-            categories = api.get_categories()
-            accounts = api.get_account_names()
-        except Exception:
-            categories, accounts = [], ["現金"]
+            st.markdown("#### 取引として登録")
+            try:
+                ocr_cats = api.get_categories()
+                ocr_accounts = api.get_account_names()
+            except Exception:
+                ocr_cats, ocr_accounts = [], ["現金"]
 
-        expense_cats = [c["name"] for c in categories if c["type"] == "支出"]
-        with st.form("ocr_confirm"):
-            oc1, oc2, oc3 = st.columns(3)
-            ocr_date = oc1.date_input("日付", value=date.fromisoformat(res.get("date", str(today))))
-            ocr_cat = oc2.selectbox("カテゴリ", expense_cats if expense_cats else ["食費"])
-            ocr_account = oc3.selectbox("口座", accounts if accounts else ["現金"])
-            ocr_amount = st.number_input("金額", value=res.get("total", 0), min_value=1)
-            ocr_memo = st.text_input("メモ", value=res.get("store", ""))
-            if st.form_submit_button("登録", type="primary"):
-                try:
-                    api.add_transaction(
-                        date=str(ocr_date), type="支出", category=ocr_cat,
-                        amount=int(ocr_amount), memo=ocr_memo, account=ocr_account,
-                    )
-                    del st.session_state["ocr_result"]
-                    st.success("登録しました ✓")
-                    st.cache_data.clear()
-                except Exception as e:
-                    st.error(f"登録失敗: {e}")
+            expense_cats = [c["name"] for c in ocr_cats if c["type"] == "支出"]
+            pre_cat = res.get("category", "")
+            cat_idx = expense_cats.index(pre_cat) if pre_cat in expense_cats else 0
+
+            try:
+                pre_date = date.fromisoformat(res.get("date", str(today)))
+            except ValueError:
+                pre_date = today
+
+            with st.form("ocr_confirm"):
+                oc1, oc2, oc3 = st.columns(3)
+                ocr_date = oc1.date_input("日付", value=pre_date)
+                ocr_cat = oc2.selectbox("カテゴリ", expense_cats if expense_cats else ["食費"],
+                                        index=cat_idx)
+                ocr_account = oc3.selectbox("口座", ocr_accounts if ocr_accounts else ["現金"])
+                ocr_amount = st.number_input(
+                    "金額", value=int(res.get("total", res.get("amount", 0))), min_value=1)
+                ocr_memo = st.text_input("メモ", value=str(res.get("store", res.get("memo", ""))))
+                if st.form_submit_button("登録", type="primary", use_container_width=True):
+                    try:
+                        api.add_transaction(
+                            date=str(ocr_date), type="支出", category=ocr_cat,
+                            amount=int(ocr_amount), memo=ocr_memo, account=ocr_account,
+                        )
+                        st.session_state.pop("ocr_result", None)
+                        st.session_state.pop("_ocr2_file_id", None)
+                        st.success("登録しました ✓")
+                        st.cache_data.clear()
+                        st.rerun()
+                    except Exception as e:
+                        st.error(f"登録失敗: {e}")
+    else:
+        st.info("画像をアップロードすると AI が自動でレシートを解析します。")
 
 
 # ════════════════════════════════════════════════════════════════════════════

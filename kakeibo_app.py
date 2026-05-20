@@ -1079,15 +1079,19 @@ def show_ocr_tab(year: int, month: int):
                 st.code('ANTHROPIC_API_KEY = "sk-ant-..."', language="toml")
         else:
             uploaded = st.file_uploader(
-                "レシート画像をアップロード",
+                "レシート画像をドロップ / クリックして選択",
                 type=["jpg", "jpeg", "png", "gif", "webp"],
-                help="JPG / PNG / GIF / WebP 対応",
+                help="JPG / PNG / GIF / WebP 対応 — アップロード後に自動解析します",
                 key="ocr_uploader",
+                label_visibility="collapsed",
             )
             if uploaded:
-                st.image(uploaded, caption="アップロード画像", use_column_width=True)
-                if st.button("🔍 AIで読み取る", type="primary", use_container_width=True):
-                    image_bytes = uploaded.read()
+                st.image(uploaded, caption=uploaded.name, use_column_width=True)
+                # Auto-OCR: trigger only when a new file is detected
+                if st.session_state.get("_mono_ocr_file_id") != uploaded.file_id:
+                    st.session_state["_mono_ocr_file_id"] = uploaded.file_id
+                    st.session_state.pop("ocr_result", None)
+                    image_bytes = uploaded.getvalue()
                     ext = uploaded.name.rsplit(".", 1)[-1].lower()
                     media_type = MEDIA_TYPE_MAP.get(ext, "image/jpeg")
                     with st.spinner("Claude AIがレシートを解析中..."):
