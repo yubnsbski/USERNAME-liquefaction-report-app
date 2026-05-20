@@ -472,3 +472,120 @@ class TestAnomalyDetection:
         flagged = app.detect_anomalies(2026, 5)
         for col in ["date", "category", "amount", "memo", "z_score"]:
             assert col in flagged.columns
+
+
+# ─────────────────────────────────────────────
+# 予算管理
+# ─────────────────────────────────────────────
+
+class TestBudget:
+    def test_set_and_get_budget(self, tmp_paths):
+        app.set_budget(2026, 5, "食費", 30000)
+        budgets = app.get_budgets(2026, 5)
+        assert budgets["食費"] == 30000
+
+    def test_overwrite_budget(self, tmp_paths):
+        app.set_budget(2026, 5, "食費", 30000)
+        app.set_budget(2026, 5, "食費", 40000)
+        assert app.get_budgets(2026, 5)["食費"] == 40000
+
+    def test_delete_budget(self, tmp_paths):
+        app.set_budget(2026, 5, "食費", 30000)
+        app.delete_budget(2026, 5, "食費")
+        assert "食費" not in app.get_budgets(2026, 5)
+
+    def test_budget_status_columns(self, tmp_paths):
+        app.set_budget(2026, 5, "食費", 30000)
+        app.add_transaction("2026-05-01", "支出", "食費", 15000, "")
+        df = app.get_budget_status(2026, 5)
+        assert not df.empty
+        for col in ["category", "budget", "actual", "usage_pct", "over_budget"]:
+            assert col in df.columns
+
+    def test_budget_status_over_budget(self, tmp_paths):
+        app.set_budget(2026, 5, "食費", 10000)
+        app.add_transaction("2026-05-01", "支出", "食費", 20000, "")
+        df = app.get_budget_status(2026, 5)
+        row = df[df["category"] == "食費"].iloc[0]
+        assert bool(row["over_budget"]) is True
+        assert row["usage_pct"] == 200.0
+
+    def test_budget_status_under_budget(self, tmp_paths):
+        app.set_budget(2026, 5, "食費", 30000)
+        app.add_transaction("2026-05-01", "支出", "食費", 10000, "")
+        df = app.get_budget_status(2026, 5)
+        row = df[df["category"] == "食費"].iloc[0]
+        assert bool(row["over_budget"]) is False
+
+    def test_no_budget_returns_empty(self, tmp_paths):
+        df = app.get_budget_status(2026, 5)
+        assert df.empty
+
+    def test_budgets_isolated_by_month(self, tmp_paths):
+        app.set_budget(2026, 5, "食費", 30000)
+        app.set_budget(2026, 6, "食費", 40000)
+        assert app.get_budgets(2026, 5)["食費"] == 30000
+        assert app.get_budgets(2026, 6)["食費"] == 40000
+
+
+# ─────────────────────────────────────────────
+# 定期取引
+# ─────────────────────────────────────────────
+
+class TestRecurring:
+    def test_add_and_get_recurring(self, tmp_paths):
+        app.add_recurring("支出", "住居費", 80000, "家賃", 1)
+        df = app.get_recurring()
+        assert len(df) == 1
+        assert df.iloc[0]["category"] == "住居費"
+        assert df.iloc[0]["amount"] == 80000
+
+    def test_toggle_inactive(self, tmp_paths):
+        app.add_recurring("支出", "住居費", 80000, "家賃", 1)
+        rec_id = int(app.get_recurring(active_only=False).iloc[0]["id"])
+        app.toggle_recurring(rec_id, False)
+        df_active = app.get_recurring(active_only=True)
+        assert df_active.empty
+
+    def test_toggle_back_active(self, tmp_paths):
+        app.add_recurring("支出", "住居費", 80000, "家賃", 1)
+        rec_id = int(app.get_recurring(active_only=False).iloc[0]["id"])
+        app.toggle_recurring(rec_id, False)
+        app.toggle_recurring(rec_id, True)
+        assert len(app.get_recurring(active_only=True)) == 1
+
+    def test_delete_recurring(self, tmp_paths):
+        app.add_recurring("支出", "住居費", 80000, "家賃", 1)
+        rec_id = int(app.get_recurring(active_only=False).iloc[0]["id"])
+        app.delete_recurring(rec_id)
+        assert app.get_recurring(active_only=False).empty
+
+    def test_apply_recurring_registers_transactions(self, tmp_paths):
+        app.add_recurring("支出", "住居費", 80000, "家賃", 1)
+        app.add_recurring("支出", "通信費", 5000, "スマホ", 15)
+        n = app.apply_recurring(2026, 5)
+        assert n == 2
+        df = app.get_transactions(year=2026, month=5)
+        assert len(df) == 2
+
+    def test_apply_recurring_no_duplicate(self, tmp_paths):
+        app.add_recurring("支出", "住居費", 80000, "家賃", 1)
+        app.apply_recurring(2026, 5)
+        n2 = app.apply_recurring(2026, 5)
+        assert n2 == 0
+        assert len(app.get_transactions(year=2026, month=5)) == 1
+
+    def test_apply_recurring_inactive_skipped(self, tmp_paths):
+        app.add_recurring("支出", "住居費", 80000, "家賃", 1)
+        rec_id = int(app.get_recurring(active_only=False).iloc[0]["id"])
+        app.toggle_recurring(rec_id, False)
+        n = app.apply_recurring(2026, 5)
+        assert n == 0
+
+    def test_apply_recurring_respects_month_end(self, tmp_paths):
+        # day=31 should clamp to last day of February (28)
+        app.add_recurring("支出", "その他", 1000, "test", 28)
+        n = app.apply_recurring(2026, 2)
+        assert n == 1
+        df = app.get_transactions(year=2026, month=2)
+        assert df.iloc[0]["date"] == "2026-02-28"

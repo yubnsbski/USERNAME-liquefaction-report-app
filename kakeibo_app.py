@@ -137,6 +137,26 @@ def init_db():
             type TEXT NOT NULL CHECK(type IN ('支出','収入'))
         )
     """)
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS budgets (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            year_month TEXT NOT NULL,
+            category TEXT NOT NULL,
+            amount INTEGER NOT NULL CHECK(amount > 0),
+            UNIQUE(year_month, category)
+        )
+    """)
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS recurring (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            type TEXT NOT NULL CHECK(type IN ('支出','収入')),
+            category TEXT NOT NULL,
+            amount INTEGER NOT NULL CHECK(amount > 0),
+            memo TEXT DEFAULT '',
+            day_of_month INTEGER NOT NULL DEFAULT 1 CHECK(day_of_month BETWEEN 1 AND 28),
+            active INTEGER NOT NULL DEFAULT 1
+        )
+    """)
     # Seed default categories
     existing = {row[0] for row in c.execute("SELECT name FROM categories").fetchall()}
     for cat in DEFAULT_EXPENSE_CATEGORIES:
@@ -280,6 +300,127 @@ def delete_month_data(year: int, month: int):
     conn.execute("DELETE FROM transactions WHERE date LIKE ?", (f"{month_str}%",))
     conn.commit()
     conn.close()
+
+
+# ── 予算 ──────────────────────────────────────
+
+def set_budget(year: int, month: int, category: str, amount: int):
+    ym = f"{year}-{month:02d}"
+    conn = get_connection()
+    conn.execute(
+        "INSERT INTO budgets (year_month, category, amount) VALUES (?,?,?) "
+        "ON CONFLICT(year_month, category) DO UPDATE SET amount=excluded.amount",
+        (ym, category, amount),
+    )
+    conn.commit()
+    conn.close()
+
+
+def get_budgets(year: int, month: int) -> dict:
+    """Returns {category: budget_amount} for the given month."""
+    ym = f"{year}-{month:02d}"
+    conn = get_connection()
+    rows = conn.execute("SELECT category, amount FROM budgets WHERE year_month=?", (ym,)).fetchall()
+    conn.close()
+    return {r[0]: r[1] for r in rows}
+
+
+def delete_budget(year: int, month: int, category: str):
+    ym = f"{year}-{month:02d}"
+    conn = get_connection()
+    conn.execute("DELETE FROM budgets WHERE year_month=? AND category=?", (ym, category))
+    conn.commit()
+    conn.close()
+
+
+def get_budget_status(year: int, month: int) -> pd.DataFrame:
+    """Returns DataFrame with category, budget, actual, usage_pct, over_budget."""
+    budgets = get_budgets(year, month)
+    if not budgets:
+        return pd.DataFrame()
+    df = get_transactions(year=year, month=month, tx_type="支出")
+    actual_by_cat = df.groupby("category")["amount"].sum().to_dict() if not df.empty else {}
+    rows = []
+    for cat, budget in budgets.items():
+        actual = actual_by_cat.get(cat, 0)
+        rows.append({
+            "category": cat,
+            "budget": budget,
+            "actual": actual,
+            "usage_pct": round(actual / budget * 100, 1),
+            "over_budget": actual > budget,
+        })
+    return pd.DataFrame(rows).sort_values("usage_pct", ascending=False)
+
+
+# ── 定期取引 ──────────────────────────────────
+
+def add_recurring(tx_type: str, category: str, amount: int, memo: str, day_of_month: int) -> bool:
+    try:
+        conn = get_connection()
+        conn.execute(
+            "INSERT INTO recurring (type, category, amount, memo, day_of_month) VALUES (?,?,?,?,?)",
+            (tx_type, category, amount, memo, day_of_month),
+        )
+        conn.commit()
+        conn.close()
+        return True
+    except Exception:
+        return False
+
+
+def get_recurring(active_only: bool = True) -> pd.DataFrame:
+    conn = get_connection()
+    q = "SELECT * FROM recurring"
+    if active_only:
+        q += " WHERE active=1"
+    q += " ORDER BY day_of_month, id"
+    df = pd.read_sql_query(q, conn)
+    conn.close()
+    return df
+
+
+def toggle_recurring(rec_id: int, active: bool):
+    conn = get_connection()
+    conn.execute("UPDATE recurring SET active=? WHERE id=?", (1 if active else 0, rec_id))
+    conn.commit()
+    conn.close()
+
+
+def delete_recurring(rec_id: int):
+    conn = get_connection()
+    conn.execute("DELETE FROM recurring WHERE id=?", (rec_id,))
+    conn.commit()
+    conn.close()
+
+
+def apply_recurring(year: int, month: int) -> int:
+    """
+    Register active recurring transactions for the given month.
+    Skips entries whose (date, category, amount) already exists to prevent duplicates.
+    Returns the number of newly registered transactions.
+    """
+    rec_df = get_recurring(active_only=True)
+    if rec_df.empty:
+        return 0
+
+    existing = get_transactions(year=year, month=month)
+    count = 0
+    for _, r in rec_df.iterrows():
+        day = min(int(r["day_of_month"]), calendar.monthrange(year, month)[1])
+        tx_date = f"{year}-{month:02d}-{day:02d}"
+        # Duplicate check: same date + category + amount
+        if not existing.empty:
+            dup = existing[
+                (existing["date"] == tx_date) &
+                (existing["category"] == r["category"]) &
+                (existing["amount"] == int(r["amount"]))
+            ]
+            if not dup.empty:
+                continue
+        add_transaction(tx_date, r["type"], r["category"], int(r["amount"]), r["memo"])
+        count += 1
+    return count
 
 
 # ─────────────────────────────────────────────
@@ -784,6 +925,19 @@ def show_input_tab(year: int, month: int):
             st.session_state.quick_add_total = 0
             st.rerun()
 
+    # 定期取引の一括適用
+    rec_df = get_recurring(active_only=True)
+    if not rec_df.empty:
+        st.markdown("---")
+        if st.button(f"🔁 定期取引を今月に適用 ({len(rec_df)}件)", use_container_width=True):
+            n = apply_recurring(year, month)
+            if n > 0:
+                st.success(f"✅ {n}件の定期取引を登録しました。")
+                st.session_state["ml_retrain"] = True
+                st.rerun()
+            else:
+                st.info("今月分はすでに登録済みです。")
+
     # Recent entries
     st.subheader("最近の登録 (5件)")
     recent = get_recent_transactions(5)
@@ -1025,13 +1179,36 @@ def show_charts_tab(year: int, month: int):
     st.subheader("📊 グラフ分析")
     st.caption(f"{year}年{month}月のデータを表示しています")
 
-    chart_tab1, chart_tab2, chart_tab3 = st.tabs(["支出内訳", "日別収支", "累計収支"])
+    chart_tab1, chart_tab2, chart_tab3, chart_tab4 = st.tabs(["支出内訳", "日別収支", "累計収支", "予算 vs 実績"])
     with chart_tab1:
         chart_expense_pie(year, month)
     with chart_tab2:
         chart_daily_bar(year, month)
     with chart_tab3:
         chart_cumulative_line(year, month)
+    with chart_tab4:
+        bstatus = get_budget_status(year, month)
+        if bstatus.empty:
+            st.info("予算が設定されていません。⚙️設定タブから予算を登録してください。")
+        else:
+            fig = go.Figure()
+            fig.add_trace(go.Bar(
+                name="予算", x=bstatus["category"], y=bstatus["budget"],
+                marker_color="#aab4f8", opacity=0.8,
+            ))
+            fig.add_trace(go.Bar(
+                name="実績", x=bstatus["category"], y=bstatus["actual"],
+                marker_color=["#ff6b6b" if v else "#51cf66" for v in bstatus["over_budget"]],
+            ))
+            fig.update_layout(
+                barmode="group", title="予算 vs 実績",
+                yaxis_title="金額（円）", height=380,
+                margin=dict(t=50, b=40),
+            )
+            st.plotly_chart(fig, use_container_width=True)
+            over = bstatus[bstatus["over_budget"]]
+            if not over.empty:
+                st.warning(f"⚠️ 予算超過: {', '.join(over['category'].tolist())}")
 
 
 def show_export_tab(year: int, month: int):
@@ -1128,7 +1305,9 @@ def show_export_tab(year: int, month: int):
 def show_settings_tab(year: int, month: int):
     st.subheader("⚙️ 設定")
 
-    set_tab1, set_tab2, set_tab3 = st.tabs(["🔐 PINロック", "🏷️ カテゴリ管理", "💿 データ管理"])
+    set_tab1, set_tab2, set_tab3, set_tab4, set_tab5 = st.tabs([
+        "🔐 PINロック", "🏷️ カテゴリ管理", "📋 予算設定", "🔁 定期取引", "💿 データ管理"
+    ])
 
     # ── PIN Tab ──
     with set_tab1:
@@ -1231,8 +1410,78 @@ def show_settings_tab(year: int, month: int):
                     else:
                         st.error("このカテゴリは使用中のため削除できません。")
 
-    # ── Data Management Tab ──
+    # ── Budget Tab ──
     with set_tab3:
+        st.markdown("#### 月別予算設定")
+        st.caption(f"{year}年{month}月のカテゴリ別予算を設定します。")
+
+        expense_cats = get_categories("支出")
+        with st.form("budget_form"):
+            col1, col2 = st.columns(2)
+            with col1:
+                b_cat = st.selectbox("カテゴリ", expense_cats, key="budget_cat")
+            with col2:
+                b_amount = st.number_input("予算（円）", min_value=100, step=1000, format="%d", key="budget_amount")
+            if st.form_submit_button("💾 設定", type="primary"):
+                set_budget(year, month, b_cat, int(b_amount))
+                st.success(f"{b_cat} の予算を ¥{int(b_amount):,} に設定しました。")
+                st.rerun()
+
+        bstatus = get_budget_status(year, month)
+        if not bstatus.empty:
+            st.markdown("**現在の予算状況**")
+            for _, row in bstatus.iterrows():
+                c1, c2, c3 = st.columns([3, 2, 1])
+                c1.write(f"**{row['category']}**")
+                over = "⚠️ 超過" if row["over_budget"] else f"{row['usage_pct']}%"
+                c2.write(f"¥{row['actual']:,} / ¥{row['budget']:,}  {over}")
+                if c3.button("削除", key=f"del_budget_{row['category']}"):
+                    delete_budget(year, month, row["category"])
+                    st.rerun()
+        else:
+            st.info("この月の予算はまだ設定されていません。")
+
+    # ── Recurring Tab ──
+    with set_tab4:
+        st.markdown("#### 定期取引")
+        st.caption("毎月自動で登録したい取引を設定します（家賃・サブスクなど）。")
+
+        with st.form("recurring_form"):
+            col1, col2 = st.columns(2)
+            with col1:
+                r_type = st.radio("種別", ["支出", "収入"], horizontal=True, key="rec_type")
+            with col2:
+                r_day = st.number_input("引落日", min_value=1, max_value=28, value=1, step=1, key="rec_day")
+            r_cats = get_categories(r_type)
+            r_cat = st.selectbox("カテゴリ", r_cats, key="rec_cat")
+            r_amount = st.number_input("金額（円）", min_value=1, step=100, format="%d", key="rec_amount")
+            r_memo = st.text_input("メモ", placeholder="例: 家賃、Netflix", key="rec_memo")
+            if st.form_submit_button("➕ 追加", type="primary"):
+                if add_recurring(r_type, r_cat, int(r_amount), r_memo, int(r_day)):
+                    st.success("定期取引を追加しました。")
+                    st.rerun()
+
+        st.markdown("---")
+        rec_df = get_recurring(active_only=False)
+        if rec_df.empty:
+            st.info("定期取引が登録されていません。")
+        else:
+            st.markdown("**登録済み定期取引**")
+            for _, r in rec_df.iterrows():
+                c1, c2, c3, c4 = st.columns([3, 2, 1, 1])
+                active = bool(r["active"])
+                c1.write(f"{'✅' if active else '⏸️'} 毎月{r['day_of_month']}日 **{r['category']}** {r['memo']}")
+                c2.write(f"{r['type']} ¥{int(r['amount']):,}")
+                if c3.button("⏸️" if active else "▶️", key=f"tog_rec_{r['id']}",
+                             help="無効化" if active else "有効化"):
+                    toggle_recurring(int(r["id"]), not active)
+                    st.rerun()
+                if c4.button("🗑️", key=f"del_rec_{r['id']}", help="削除"):
+                    delete_recurring(int(r["id"]))
+                    st.rerun()
+
+    # ── Data Management Tab ──
+    with set_tab5:
         st.markdown("#### データ管理")
         st.text(f"DBファイル: {DB_PATH}")
         st.text(f"総レコード数: {get_total_record_count():,} 件")
@@ -1375,16 +1624,27 @@ def show_sidebar() -> tuple:
             delta_color=delta_color
         )
 
-        # Budget progress bar: expense vs income
+        # 収支比率
         if summary["income"] > 0:
             usage_ratio = min(summary["expense"] / summary["income"], 1.0)
-            pct = usage_ratio * 100
-            bar_color = "normal"
-            st.markdown(f"**支出率: {pct:.1f}%**")
+            st.markdown(f"**支出率: {usage_ratio*100:.1f}%**")
             st.progress(usage_ratio)
         elif summary["expense"] > 0:
             st.progress(1.0)
             st.caption("支出のみのデータです")
+
+        # 予算進捗
+        bstatus = get_budget_status(year, month)
+        if not bstatus.empty:
+            st.markdown("---")
+            st.markdown("**📋 予算進捗**")
+            for _, row in bstatus.iterrows():
+                ratio = min(row["actual"] / row["budget"], 1.0)
+                label = f"{row['category']} {row['usage_pct']}%"
+                if row["over_budget"]:
+                    label += " ⚠️"
+                st.caption(label)
+                st.progress(ratio)
 
         st.markdown("---")
         st.caption(f"DB: {os.path.basename(DB_PATH)}")
