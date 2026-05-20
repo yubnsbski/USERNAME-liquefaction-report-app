@@ -7,5 +7,9 @@ openpyxl
 bcrypt
 anthropic>=0.40.0
 scikit-learn>=1.4.0
+fastapi
+uvicorn[standard]
+requests
+httpx
 pytest
 pytest-mock
