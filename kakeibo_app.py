@@ -157,6 +157,23 @@ def init_db():
             active INTEGER NOT NULL DEFAULT 1
         )
     """)
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS accounts (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT NOT NULL UNIQUE,
+            type TEXT NOT NULL DEFAULT '現金',
+            initial_balance INTEGER NOT NULL DEFAULT 0,
+            note TEXT DEFAULT ''
+        )
+    """)
+    # accounts migration: seed default if empty
+    if c.execute("SELECT COUNT(*) FROM accounts").fetchone()[0] == 0:
+        for name, atype in [("現金", "現金"), ("銀行口座", "銀行"), ("クレジットカード", "クレジット")]:
+            c.execute("INSERT OR IGNORE INTO accounts (name, type) VALUES (?,?)", (name, atype))
+    # transactions migration: add account column if missing
+    cols = {row[1] for row in c.execute("PRAGMA table_info(transactions)").fetchall()}
+    if "account" not in cols:
+        c.execute("ALTER TABLE transactions ADD COLUMN account TEXT NOT NULL DEFAULT '現金'")
     # Seed default categories
     existing = {row[0] for row in c.execute("SELECT name FROM categories").fetchall()}
     for cat in DEFAULT_EXPENSE_CATEGORIES:
@@ -169,12 +186,12 @@ def init_db():
     conn.close()
 
 
-def add_transaction(date_str: str, tx_type: str, category: str, amount: int, memo: str) -> bool:
+def add_transaction(date_str: str, tx_type: str, category: str, amount: int, memo: str, account: str = "現金") -> bool:
     try:
         conn = get_connection()
         conn.execute(
-            "INSERT INTO transactions (date, type, category, amount, memo) VALUES (?, ?, ?, ?, ?)",
-            (date_str, tx_type, category, amount, memo)
+            "INSERT INTO transactions (date, type, category, amount, memo, account) VALUES (?,?,?,?,?,?)",
+            (date_str, tx_type, category, amount, memo, account),
         )
         conn.commit()
         conn.close()
@@ -198,14 +215,17 @@ def get_transactions(
     categories: list = None,
     start_date: str = None,
     end_date: str = None,
+    account: str = None,
+    keyword: str = None,
+    amount_min: int = None,
+    amount_max: int = None,
 ) -> pd.DataFrame:
     conn = get_connection()
     query = "SELECT * FROM transactions WHERE 1=1"
     params = []
     if year and month:
-        month_str = f"{year}-{month:02d}"
         query += " AND date LIKE ?"
-        params.append(f"{month_str}%")
+        params.append(f"{year}-{month:02d}%")
     elif year:
         query += " AND date LIKE ?"
         params.append(f"{year}%")
@@ -222,6 +242,18 @@ def get_transactions(
         placeholders = ",".join("?" * len(categories))
         query += f" AND category IN ({placeholders})"
         params.extend(categories)
+    if account and account != "すべて":
+        query += " AND account = ?"
+        params.append(account)
+    if keyword:
+        query += " AND (memo LIKE ? OR category LIKE ?)"
+        params.extend([f"%{keyword}%", f"%{keyword}%"])
+    if amount_min is not None:
+        query += " AND amount >= ?"
+        params.append(amount_min)
+    if amount_max is not None:
+        query += " AND amount <= ?"
+        params.append(amount_max)
     query += " ORDER BY date DESC, id DESC"
     df = pd.read_sql_query(query, conn, params=params)
     conn.close()
@@ -300,6 +332,63 @@ def delete_month_data(year: int, month: int):
     conn.execute("DELETE FROM transactions WHERE date LIKE ?", (f"{month_str}%",))
     conn.commit()
     conn.close()
+
+
+# ── 予算 ──────────────────────────────────────
+
+# ── 口座管理 ──────────────────────────────────
+
+def get_accounts() -> list[dict]:
+    conn = get_connection()
+    rows = conn.execute("SELECT * FROM accounts ORDER BY id").fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
+
+
+def get_account_names() -> list[str]:
+    return [a["name"] for a in get_accounts()]
+
+
+def add_account(name: str, atype: str, initial_balance: int = 0, note: str = "") -> bool:
+    try:
+        conn = get_connection()
+        conn.execute(
+            "INSERT INTO accounts (name, type, initial_balance, note) VALUES (?,?,?,?)",
+            (name, atype, initial_balance, note),
+        )
+        conn.commit()
+        conn.close()
+        return True
+    except Exception:
+        return False
+
+
+def delete_account(account_name: str) -> bool:
+    conn = get_connection()
+    used = conn.execute(
+        "SELECT COUNT(*) FROM transactions WHERE account=?", (account_name,)
+    ).fetchone()[0]
+    if used:
+        conn.close()
+        return False
+    conn.execute("DELETE FROM accounts WHERE name=?", (account_name,))
+    conn.commit()
+    conn.close()
+    return True
+
+
+def get_account_balance(account_name: str) -> int:
+    """Initial balance + income - expense for this account across all time."""
+    conn = get_connection()
+    row = conn.execute("SELECT initial_balance FROM accounts WHERE name=?", (account_name,)).fetchone()
+    initial = row[0] if row else 0
+    conn.close()
+    df = get_transactions(account=account_name)
+    if df.empty:
+        return initial
+    income = int(df[df["type"] == "収入"]["amount"].sum())
+    expense = int(df[df["type"] == "支出"]["amount"].sum())
+    return initial + income - expense
 
 
 # ── 予算 ──────────────────────────────────────
@@ -890,10 +979,14 @@ def show_input_tab(year: int, month: int):
         with col2:
             tx_date = st.date_input("日付", value=date.today(), key="form_date")
 
-        categories = get_categories(tx_type)
-        # AI予測カテゴリを初期選択に反映
-        default_idx = categories.index(pred_cat) if pred_cat in categories else 0
-        category = st.selectbox("カテゴリ", categories, index=default_idx, key="form_category")
+        col_cat, col_acc = st.columns(2)
+        with col_cat:
+            categories = get_categories(tx_type)
+            default_idx = categories.index(pred_cat) if pred_cat in categories else 0
+            category = st.selectbox("カテゴリ", categories, index=default_idx, key="form_category")
+        with col_acc:
+            account_names = get_account_names()
+            account = st.selectbox("口座", account_names, key="form_account")
 
         amount = st.number_input(
             "金額 (円)", min_value=0, step=100, format="%d", key="form_amount",
@@ -913,7 +1006,7 @@ def show_input_tab(year: int, month: int):
             if final_amount <= 0:
                 st.error("金額は1円以上入力してください。")
             else:
-                if add_transaction(str(tx_date), tx_type, category, final_amount, memo):
+                if add_transaction(str(tx_date), tx_type, category, final_amount, memo, account):
                     st.success(f"✅ 登録完了: {tx_type} {category} ¥{final_amount:,}")
                     st.session_state.quick_add_total = 0
                     st.session_state["ml_retrain"] = True  # 新データで再学習フラグ
@@ -1092,30 +1185,30 @@ def show_ocr_tab(year: int, month: int):
 def show_list_tab(year: int, month: int):
     st.subheader("📋 取引一覧")
 
-    col1, col2 = st.columns(2)
+    col1, col2, col3 = st.columns(3)
     with col1:
-        filter_type = st.radio("種別フィルター", ["すべて", "支出", "収入"], horizontal=True, key="list_type")
+        filter_type = st.radio("種別", ["すべて", "支出", "収入"], horizontal=True, key="list_type")
     with col2:
-        # カテゴリ候補を種別フィルターに連動させる
-        if filter_type == "すべて":
-            cat_pool = [c["name"] for c in get_categories()]
-        else:
-            cat_pool = get_categories(filter_type)
-        filter_cats = st.multiselect("カテゴリフィルター", cat_pool, key="list_cats")
+        cat_pool = [c["name"] for c in get_categories()] if filter_type == "すべて" else get_categories(filter_type)
+        filter_cats = st.multiselect("カテゴリ", cat_pool, key="list_cats")
+    with col3:
+        acc_options = ["すべて"] + get_account_names()
+        filter_account = st.selectbox("口座", acc_options, key="list_account")
 
     df = get_transactions(
         year=year, month=month,
         tx_type=filter_type if filter_type != "すべて" else None,
-        categories=filter_cats if filter_cats else None
+        categories=filter_cats if filter_cats else None,
+        account=filter_account if filter_account != "すべて" else None,
     )
 
     if df.empty:
         st.info("この月のデータがありません。")
         return
 
-    # Display dataframe
-    display_df = df[["date", "type", "category", "amount", "memo"]].copy()
-    display_df.columns = ["日付", "種別", "カテゴリ", "金額", "メモ"]
+    display_cols = ["date", "type", "account", "category", "amount", "memo"]
+    display_df = df[display_cols].copy()
+    display_df.columns = ["日付", "種別", "口座", "カテゴリ", "金額", "メモ"]
     display_df["金額"] = display_df["金額"].apply(lambda x: f"¥{int(x):,}")
 
     st.dataframe(
@@ -1305,8 +1398,8 @@ def show_export_tab(year: int, month: int):
 def show_settings_tab(year: int, month: int):
     st.subheader("⚙️ 設定")
 
-    set_tab1, set_tab2, set_tab3, set_tab4, set_tab5 = st.tabs([
-        "🔐 PINロック", "🏷️ カテゴリ管理", "📋 予算設定", "🔁 定期取引", "💿 データ管理"
+    set_tab1, set_tab2, set_tab3, set_tab4, set_tab5, set_tab6 = st.tabs([
+        "🔐 PINロック", "🏷️ カテゴリ管理", "📋 予算設定", "🔁 定期取引", "💳 口座管理", "💿 データ管理"
     ])
 
     # ── PIN Tab ──
@@ -1480,8 +1573,46 @@ def show_settings_tab(year: int, month: int):
                     delete_recurring(int(r["id"]))
                     st.rerun()
 
-    # ── Data Management Tab ──
+    # ── Accounts Tab ──
     with set_tab5:
+        st.markdown("#### 口座・財布の管理")
+        ACCOUNT_TYPES = ["現金", "銀行", "クレジット", "電子マネー", "その他"]
+        with st.form("account_form"):
+            col1, col2, col3 = st.columns(3)
+            with col1:
+                a_name = st.text_input("口座名", placeholder="例: 楽天銀行")
+            with col2:
+                a_type = st.selectbox("種別", ACCOUNT_TYPES)
+            with col3:
+                a_init = st.number_input("初期残高（円）", min_value=0, step=1000, format="%d")
+            a_note = st.text_input("メモ（任意）")
+            if st.form_submit_button("➕ 追加", type="primary"):
+                if not a_name.strip():
+                    st.error("口座名を入力してください。")
+                elif add_account(a_name.strip(), a_type, int(a_init), a_note):
+                    st.success(f"「{a_name}」を追加しました。")
+                    st.rerun()
+                else:
+                    st.error("同名の口座が既に存在します。")
+
+        accounts = get_accounts()
+        if accounts:
+            st.markdown("---")
+            st.markdown("**登録口座一覧**")
+            for acc in accounts:
+                bal = get_account_balance(acc["name"])
+                c1, c2, c3 = st.columns([3, 2, 1])
+                c1.write(f"**{acc['name']}** ({acc['type']})")
+                c2.write(f"残高: ¥{bal:,}")
+                if c3.button("🗑️", key=f"del_acc_{acc['id']}", help="削除"):
+                    if delete_account(acc["name"]):
+                        st.success(f"「{acc['name']}」を削除しました。")
+                        st.rerun()
+                    else:
+                        st.error("この口座は取引データで使用中のため削除できません。")
+
+    # ── Data Management Tab ──
+    with set_tab6:
         st.markdown("#### データ管理")
         st.text(f"DBファイル: {DB_PATH}")
         st.text(f"総レコード数: {get_total_record_count():,} 件")
@@ -1514,6 +1645,155 @@ def show_settings_tab(year: int, month: int):
                     if st.button("❌ キャンセル", use_container_width=True, key="cancel_month_del"):
                         del st.session_state["confirm_month_delete"]
                         st.rerun()
+
+
+def show_dashboard_tab(year: int, month: int):
+    st.subheader("🏠 ダッシュボード")
+
+    # ── 今月サマリー ──
+    summary = get_monthly_summary(year, month)
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("収入", f"¥{summary['income']:,}")
+    c2.metric("支出", f"¥{summary['expense']:,}")
+    balance = summary["balance"]
+    c3.metric("収支", f"¥{balance:,}", delta="黒字" if balance >= 0 else "赤字",
+              delta_color="normal" if balance >= 0 else "inverse")
+    bstatus = get_budget_status(year, month)
+    if not bstatus.empty and bstatus["budget"].sum() > 0:
+        overall_pct = round(bstatus["actual"].sum() / bstatus["budget"].sum() * 100, 1)
+        c4.metric("予算消化率", f"{overall_pct}%")
+    else:
+        c4.metric("登録取引数", f"{get_total_record_count():,}件")
+
+    st.markdown("---")
+
+    # ── 過去6ヶ月の収支推移 ──
+    st.markdown("#### 過去6ヶ月の収支推移")
+    months_data = []
+    for delta in range(5, -1, -1):
+        total_months = (year * 12 + month - 1) - delta
+        y, m = divmod(total_months, 12)
+        m += 1
+        s = get_monthly_summary(y, m)
+        months_data.append({"月": f"{y}/{m:02d}", "収入": s["income"], "支出": s["expense"], "収支": s["balance"]})
+    mdf = pd.DataFrame(months_data)
+    fig = go.Figure()
+    fig.add_trace(go.Bar(x=mdf["月"], y=mdf["収入"], name="収入", marker_color="#51cf66"))
+    fig.add_trace(go.Bar(x=mdf["月"], y=mdf["支出"], name="支出", marker_color="#ff6b6b"))
+    fig.add_trace(go.Scatter(x=mdf["月"], y=mdf["収支"], name="収支", mode="lines+markers",
+                             line=dict(color="#339af0", width=2), yaxis="y2"))
+    fig.update_layout(
+        barmode="group", height=320,
+        yaxis=dict(title="金額（円）"),
+        yaxis2=dict(overlaying="y", side="right", title="収支"),
+        legend=dict(orientation="h", y=1.12),
+        margin=dict(t=20, b=30),
+    )
+    st.plotly_chart(fig, use_container_width=True)
+
+    col_left, col_right = st.columns(2)
+
+    # ── 今月の支出 TOP5 ──
+    with col_left:
+        st.markdown("#### 今月の支出 TOP5")
+        exp_df = get_transactions(year=year, month=month, tx_type="支出")
+        if exp_df.empty:
+            st.info("支出データなし")
+        else:
+            top5 = exp_df.groupby("category")["amount"].sum().nlargest(5).reset_index()
+            top5.columns = ["カテゴリ", "金額"]
+            fig2 = px.bar(top5, x="金額", y="カテゴリ", orientation="h",
+                          color="金額", color_continuous_scale="Reds")
+            fig2.update_layout(height=260, margin=dict(t=10, b=10), showlegend=False)
+            st.plotly_chart(fig2, use_container_width=True)
+
+    # ── 口座残高 + 予算アラート ──
+    with col_right:
+        st.markdown("#### 口座残高")
+        accounts = get_accounts()
+        if accounts:
+            for acc in accounts:
+                bal = get_account_balance(acc["name"])
+                st.metric(f"{acc['name']} ({acc['type']})", f"¥{bal:,}")
+        else:
+            st.info("口座未登録")
+
+        if not bstatus.empty:
+            over = bstatus[bstatus["over_budget"]]
+            if not over.empty:
+                st.markdown("#### ⚠️ 予算超過")
+                for _, row in over.iterrows():
+                    st.warning(f"{row['category']}: ¥{row['actual']:,} / ¥{row['budget']:,}")
+
+    # ── 直近の定期取引 ──
+    rec_df = get_recurring(active_only=True)
+    if not rec_df.empty:
+        st.markdown("---")
+        st.markdown("#### 🔁 今月の定期取引")
+        disp = rec_df[["day_of_month", "type", "category", "amount", "memo"]].copy()
+        disp.columns = ["引落日", "種別", "カテゴリ", "金額", "メモ"]
+        disp["金額"] = disp["金額"].apply(lambda x: f"¥{int(x):,}")
+        st.dataframe(disp, use_container_width=True, hide_index=True)
+
+
+def show_search_tab():
+    st.subheader("🔍 取引検索")
+
+    with st.form("search_form"):
+        col1, col2 = st.columns(2)
+        with col1:
+            kw = st.text_input("キーワード（メモ・カテゴリ）", placeholder="例: スーパー、交通費")
+            s_type = st.radio("種別", ["すべて", "支出", "収入"], horizontal=True)
+        with col2:
+            s_start = st.date_input("開始日", value=date(date.today().year, 1, 1))
+            s_end = st.date_input("終了日", value=date.today())
+
+        col3, col4 = st.columns(2)
+        with col3:
+            s_min = st.number_input("金額（以上）", min_value=0, step=100, format="%d", value=0)
+        with col4:
+            s_max = st.number_input("金額（以下）", min_value=0, step=1000, format="%d", value=0,
+                                    help="0 = 上限なし")
+        all_cats = [c["name"] for c in get_categories()]
+        s_cats = st.multiselect("カテゴリ（絞り込み）", all_cats)
+        acc_options = ["すべて"] + get_account_names()
+        s_account = st.selectbox("口座", acc_options)
+
+        searched = st.form_submit_button("🔍 検索", type="primary", use_container_width=True)
+
+    if searched:
+        df = get_transactions(
+            start_date=str(s_start),
+            end_date=str(s_end),
+            tx_type=s_type if s_type != "すべて" else None,
+            categories=s_cats if s_cats else None,
+            account=s_account if s_account != "すべて" else None,
+            keyword=kw.strip() if kw.strip() else None,
+            amount_min=int(s_min) if s_min > 0 else None,
+            amount_max=int(s_max) if s_max > 0 else None,
+        )
+
+        if df.empty:
+            st.info("該当する取引が見つかりません。")
+            return
+
+        st.success(f"{len(df)} 件 ヒット")
+        total_inc = int(df[df["type"] == "収入"]["amount"].sum())
+        total_exp = int(df[df["type"] == "支出"]["amount"].sum())
+        c1, c2, c3 = st.columns(3)
+        c1.metric("収入合計", f"¥{total_inc:,}")
+        c2.metric("支出合計", f"¥{total_exp:,}")
+        c3.metric("収支", f"¥{total_inc - total_exp:,}")
+
+        disp = df[["date", "type", "account", "category", "amount", "memo"]].copy()
+        disp.columns = ["日付", "種別", "口座", "カテゴリ", "金額", "メモ"]
+        disp["金額"] = disp["金額"].apply(lambda x: f"¥{int(x):,}")
+        st.dataframe(disp, use_container_width=True, hide_index=True)
+
+        csv = df_to_csv_bytes(df)
+        st.download_button("📥 検索結果をCSVで保存", data=csv,
+                           file_name=f"kakeibo_search_{s_start}_{s_end}.csv",
+                           mime="text/csv")
 
 
 def show_ml_tab(year: int, month: int):
@@ -1646,6 +1926,15 @@ def show_sidebar() -> tuple:
                 st.caption(label)
                 st.progress(ratio)
 
+        # 口座残高
+        accounts = get_accounts()
+        if accounts:
+            st.markdown("---")
+            st.markdown("**💳 口座残高**")
+            for acc in accounts:
+                bal = get_account_balance(acc["name"])
+                st.caption(f"{acc['name']}: ¥{bal:,}")
+
         st.markdown("---")
         st.caption(f"DB: {os.path.basename(DB_PATH)}")
         st.caption(f"総件数: {get_total_record_count():,}件")
@@ -1696,9 +1985,11 @@ def main():
     year, month = show_sidebar()
 
     # Main tab navigation
-    tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs([
+    tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8, tab9 = st.tabs([
+        "🏠 ダッシュボード",
         "✏️ 入力",
         "📷 OCR読取",
+        "🔍 検索",
         "📋 一覧",
         "📊 グラフ",
         "🤖 ML分析",
@@ -1707,24 +1998,30 @@ def main():
     ])
 
     with tab1:
-        show_input_tab(year, month)
+        show_dashboard_tab(year, month)
 
     with tab2:
-        show_ocr_tab(year, month)
+        show_input_tab(year, month)
 
     with tab3:
-        show_list_tab(year, month)
+        show_ocr_tab(year, month)
 
     with tab4:
-        show_charts_tab(year, month)
+        show_search_tab()
 
     with tab5:
-        show_ml_tab(year, month)
+        show_list_tab(year, month)
 
     with tab6:
-        show_export_tab(year, month)
+        show_charts_tab(year, month)
 
     with tab7:
+        show_ml_tab(year, month)
+
+    with tab8:
+        show_export_tab(year, month)
+
+    with tab9:
         show_settings_tab(year, month)
 
 

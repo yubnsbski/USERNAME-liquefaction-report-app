@@ -589,3 +589,95 @@ class TestRecurring:
         assert n == 1
         df = app.get_transactions(year=2026, month=2)
         assert df.iloc[0]["date"] == "2026-02-28"
+
+
+# ─────────────────────────────────────────────
+# 口座管理
+# ─────────────────────────────────────────────
+
+class TestAccounts:
+    def test_default_accounts_seeded(self, tmp_paths):
+        accounts = app.get_accounts()
+        names = [a["name"] for a in accounts]
+        assert "現金" in names
+        assert "銀行口座" in names
+
+    def test_add_account(self, tmp_paths):
+        app.add_account("楽天銀行", "銀行", 50000)
+        names = app.get_account_names()
+        assert "楽天銀行" in names
+
+    def test_add_duplicate_account_fails(self, tmp_paths):
+        app.add_account("テスト口座", "現金")
+        result = app.add_account("テスト口座", "現金")
+        assert result is False
+
+    def test_delete_unused_account(self, tmp_paths):
+        app.add_account("削除テスト", "その他")
+        result = app.delete_account("削除テスト")
+        assert result is True
+        assert "削除テスト" not in app.get_account_names()
+
+    def test_delete_in_use_account_fails(self, tmp_paths):
+        app.add_transaction("2026-05-01", "支出", "食費", 1000, "", "現金")
+        result = app.delete_account("現金")
+        assert result is False
+
+    def test_account_balance_with_transactions(self, tmp_paths):
+        app.add_account("テスト銀行", "銀行", 100000)
+        app.add_transaction("2026-05-01", "収入", "給与", 250000, "", "テスト銀行")
+        app.add_transaction("2026-05-10", "支出", "食費", 30000, "", "テスト銀行")
+        bal = app.get_account_balance("テスト銀行")
+        assert bal == 100000 + 250000 - 30000
+
+    def test_account_balance_no_transactions(self, tmp_paths):
+        app.add_account("空口座", "現金", 5000)
+        assert app.get_account_balance("空口座") == 5000
+
+
+# ─────────────────────────────────────────────
+# 検索 (get_transactions の拡張フィルタ)
+# ─────────────────────────────────────────────
+
+class TestSearch:
+    @pytest.fixture()
+    def search_db(self, tmp_paths):
+        app.add_transaction("2026-05-01", "支出", "食費", 1200, "コンビニ弁当", "現金")
+        app.add_transaction("2026-05-05", "支出", "交通費", 320, "電車代", "銀行口座")
+        app.add_transaction("2026-05-10", "収入", "給与", 250000, "5月分給与", "銀行口座")
+        app.add_transaction("2026-04-20", "支出", "娯楽費", 3000, "映画", "現金")
+        return tmp_paths
+
+    def test_keyword_search_memo(self, search_db):
+        df = app.get_transactions(keyword="コンビニ")
+        assert len(df) == 1
+        assert df.iloc[0]["category"] == "食費"
+
+    def test_keyword_search_category(self, search_db):
+        df = app.get_transactions(keyword="交通費")
+        assert len(df) == 1
+
+    def test_amount_min_filter(self, search_db):
+        df = app.get_transactions(amount_min=1000)
+        assert all(df["amount"] >= 1000)
+
+    def test_amount_max_filter(self, search_db):
+        df = app.get_transactions(amount_max=1500)
+        assert all(df["amount"] <= 1500)
+
+    def test_amount_range_filter(self, search_db):
+        df = app.get_transactions(amount_min=300, amount_max=2000)
+        assert all((df["amount"] >= 300) & (df["amount"] <= 2000))
+
+    def test_account_filter(self, search_db):
+        df = app.get_transactions(account="現金")
+        assert all(df["account"] == "現金")
+        assert len(df) == 2
+
+    def test_combined_filters(self, search_db):
+        df = app.get_transactions(
+            start_date="2026-05-01", end_date="2026-05-31",
+            tx_type="支出", account="現金",
+        )
+        assert len(df) == 1
+        assert df.iloc[0]["category"] == "食費"
